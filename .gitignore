@@ -1,0 +1,5 @@
+*.jl.cov
+*.ji
+*.o
+sim_out/
+Manifest.toml
