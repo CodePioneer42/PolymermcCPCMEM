@@ -3,3 +3,8 @@
 *.o
 sim_out/
 Manifest.toml
+sim_out/
+*.pdb
+*.out
+*.err
+*.log

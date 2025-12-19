@@ -43,10 +43,10 @@ Run the simulation and optimization pipeline. This can be executed locally or su
 
 ```bash
 # Run locally
-julia --project=. scripts/run-CPCMEM.jl
+julia --project=. scripts/run-CPCMEM.jl --config configs/test_run.toml
 
 # Or via Slurm (if headers are configured in the script)
-sbatch scripts/run-CPCMEM.jl
+sbatch scripts/run-CPCMEM.jl --config configs/test_run.toml
 ```
 
 ## 📝 Citation
