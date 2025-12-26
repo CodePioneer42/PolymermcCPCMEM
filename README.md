@@ -50,4 +50,4 @@ sbatch scripts/run-CPCMEM.jl --config configs/test_run.toml
 ```
 
 ## 📝 Citation
-This code is associated with the manuscript: *[Insert Title Here]*.
+This code is associated with the manuscript: *[Valency-Driven Division of Labor in Chromatin Architecture: Balancing Compaction with Structural Plasticity]*.
