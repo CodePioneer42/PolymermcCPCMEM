@@ -38,6 +38,8 @@ module PolymermcCPCMEM
         
         # 物理参数
         k_angle::Float64 = 0.2
+        theta0_angle::Float64 = 1.0
+
         Pcutoff_ik::Float64 = 1.5
         k_c::Float64 = 14.0
         r0::Float64 = 1.2 # free bead contact r0
@@ -589,7 +591,7 @@ module PolymermcCPCMEM
 
     function compute_bond_energy(chain::Vector{Particle3D}, params::SimulationParameters)::Float64
         energy = 0.0
-        # Dₑ: 势阱深度。这是一个关键的能量参数，描述了键的强度。
+        # Dₑ: 势阱深度。描述了键的强度。决定了断开时的能量。
         De = params.De_bond 
         # r₀: 平衡键长，即势能最低点的位置。
         r0 = params.r0_bond
@@ -632,7 +634,7 @@ module PolymermcCPCMEM
     function compute_bond_angle_energy(chain::Vector{Particle3D}, params::SimulationParameters)::Float64
         energy = 0.0
         k_angle = params.k_angle  # 从参数读取键角常数
-        theta0 = π/2       
+        theta0 = params.theta0_angle 
         
         for i in 2:length(chain)-1
             # 计算向量
@@ -2225,7 +2227,7 @@ module PolymermcCPCMEM
         
         # 输出路径处理
         output_dir = config["experiment"]["output_dir"]
-        snapshot_base_dir = joinpath(output_dir, "iter_$(iter_num)")
+        snapshot_base_dir = joinpath(output_dir, "sim_out", "iter_$(iter_num)")
         mkpath(snapshot_base_dir)
         
         # 提取 Simulation 部分配置
@@ -2267,6 +2269,8 @@ module PolymermcCPCMEM
                 # 物理参数 (映射 config -> struct)
                 lj_epsilon = phys_conf["lj_epsilon"],
                 k_angle = phys_conf["k_angle"],
+                theta0_angle = phys_conf["theta0_angle"] * π,
+
                 lj_range = phys_conf["lj_range"],
                 r0_bond = phys_conf["r0_bond"],
                 k_bond = phys_conf["k_bond"],
@@ -2315,15 +2319,22 @@ module PolymermcCPCMEM
         correction_exponent = opt_conf["correction_exponent"]
         lambda_alpha_base = opt_conf["lambda_alpha_base"]
         lambda_alpha0_base = opt_conf["lambda_alpha0_base"]
-
-        alpha = copy(initial_alpha)
-        alpha_0 = copy(initial_alpha_0)
-        N = size(alpha, 1)
-        k_max = N - 1
+        N = size(initial_alpha, 1)
 
         # 创建必要的子目录
         mkpath(joinpath(output_dir, "alpha_log"))
         mkpath(joinpath(output_dir, "contacts"))
+
+        if Step_start == 1
+            alpha = copy(initial_alpha)
+            alpha_0 = copy(initial_alpha_0)
+        else
+            alpha = read_alpha_from_file(joinpath(output_dir, "alpha_log", "$Step_start.txt"),N)
+            alpha_0 = copy(initial_alpha_0)
+        end
+        k_max = N - 1
+
+
 
         # 预计算距离校正矩阵
         CorrectionMatrix = ones(Float64, N, N)
