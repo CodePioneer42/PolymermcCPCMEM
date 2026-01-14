@@ -1,13 +1,13 @@
 [experiment]
 name = "Stage2_Opt_Run1"
-output_dir = "sim_out/run_001"
+output_dir = "sim_out/run_009"
 
 [input]
 hic_data = "data/hic_data.dat"
 
 [parallel]
-n_workers = 12
-runs_per_iter = 10
+n_workers = 6
+runs_per_iter = 5
 
 [optimization]
 max_iter = 20
@@ -22,7 +22,7 @@ temperature = 3.0
 steps_final = 2_000_000   # 2e6
 num_samples = 500
 # TF 配置: (TypeA, TypeB)
-tf_counts = [40, 5]       
+tf_counts = [40, 8]       
 tf_connectivities = [2, 3]
 
 [simulation.physics]
@@ -36,6 +36,8 @@ r0_bond = 1.4
 k_bond = 10.0
 De_bond = 20.0
 R_wall = 10.0
+theta0_angle_pai = 0.5
+
 
 # Free bead 参数
 fbead_r0 = 1.2
@@ -47,3 +49,4 @@ free_bead_LJ_epsilon = 0.0
 loop_cutoff = 2.0
 calc_contact_r0 = 1.6
 calc_contact_kc = 4.0
+

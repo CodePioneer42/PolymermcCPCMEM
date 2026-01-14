@@ -11,7 +11,7 @@ module PolymermcCPCMEM
     using Printf
     using Random
     using StaticArrays
-
+    using Dates  
     # 导出需要的类型和函数
     export SimulationParameters, Particle3D, read_alpha_from_file, optimize_alpha_main
 
@@ -38,7 +38,7 @@ module PolymermcCPCMEM
         
         # 物理参数
         k_angle::Float64 = 0.2
-        theta0_angle::Float64 = 1.0
+        theta0_angle::Float64 = 0.5  * π
 
         Pcutoff_ik::Float64 = 1.5
         k_c::Float64 = 14.0
@@ -153,7 +153,7 @@ module PolymermcCPCMEM
         values_str = parts[1:end]
         values_num = Vector{Float64}(undef, N) # 预分配向量
 
-        for i in 1:length(values_str)
+        for i in eachindex(values_str)
             # 1. 移除字符串末尾的逗号 (如果存在)
             clean_str = rstrip(values_str[i], ',')
         
@@ -343,6 +343,7 @@ module PolymermcCPCMEM
         # 计算并返回平均值。如果列表为空则返回0.0。
         return isempty(all_numbers) ? 0.0 : mean(all_numbers)
     end
+
     function calculate_modulated_contact_probability(
         output_chains::Vector{Vector{Particle3D}}, 
         tem_beads::Vector{Vector{Particle3D}}, 
@@ -379,20 +380,15 @@ module PolymermcCPCMEM
             total_contact_map .+= snapshot_contact
             total_distance_map .+= snapshot_distance
             
-            # (可选) 打印进度
-            if s % 100 == 0 || s == num_snapshots
-                println("Processed snapshot $s / $num_snapshots")
-            end
         end
 
         # 计算平均值
         avg_contact_map = total_contact_map ./ num_snapshots
         avg_distance_map = total_distance_map ./ num_snapshots
-        
-        println("Calculation finished.")
 
         return avg_contact_map, avg_distance_map
     end
+
     function _calculate_snapshot_maps(
         chain::Vector{Particle3D}, 
         free_beads::Vector{Particle3D},
@@ -430,78 +426,89 @@ module PolymermcCPCMEM
             return contact_map, distance_map
         end
         
-        # 模式二: 媒介接触模型 (CN2-CN3 超优化版)
-        # --- [核心优化开始] ---
+        # 模式二: 媒介接触模型 (通用 K 邻居版)
         log_term_matrix = zeros(Float64, N, N)
 
         k_c = params.k_c
         r0 = params.r0
         Pcutoff_ik_sq = params.Pcutoff_ik^2
-        count1, count2 = params.tf_counts
+        
+        # 追踪当前处理的 bead 在 total_beads 数组中的起始索引
+        current_bead_start_idx = 1
 
-        # --- [第一部分] 处理所有 CN2 粒子 (硬编码优化) ---
-        initial_neighbors_N2 = ntuple(_ -> (Inf, -1), Val(2))
-        for k_bead in 1:count1
-            bead = free_beads[k_bead]
-            closest_neighbors = initial_neighbors_N2
-            for i_mono in 1:N
-                mono = chain[i_mono]
-                dx = mono.x - bead.x; dy = mono.y - bead.y; dz = mono.z - bead.z
-                rik_sq = dx*dx + dy*dy + dz*dz
-                if rik_sq < Pcutoff_ik_sq && rik_sq < closest_neighbors[2][1]^2
-                    rik = sqrt(rik_sq)
-                    if rik < closest_neighbors[2][1]
-                        closest_neighbors = insert_sorted_tuple_N2(closest_neighbors, rik, i_mono)
+        # 遍历每种类型的 TF (根据 counts 和 connectivities 配对)
+        # 例如: (100, 50) counts 和 (2, 6) connectivities
+        for (count, K) in zip(params.tf_counts, params.tf_connectivities)
+            
+            # 如果该类型数量为0，跳过
+            if count == 0
+                continue
+            end
+
+            range_end = current_bead_start_idx + count - 1
+
+            # 处理该类型的每一个 bead
+            for k_bead in current_bead_start_idx:range_end
+                bead = free_beads[k_bead]
+                
+                # 初始化 K 个最近邻居列表 [(dist, index), ...]
+                # 因为只用于快照分析，这里使用简单的 Vector 即可
+                closest_neighbors = Vector{Tuple{Float64, Int}}(undef, K)
+                fill!(closest_neighbors, (Inf, -1))
+
+                # 扫描链上所有单体寻找 K 个最近邻
+                for i_mono in 1:N
+                    mono = chain[i_mono]
+                    dx = mono.x - bead.x; dy = mono.y - bead.y; dz = mono.z - bead.z
+                    rik_sq = dx*dx + dy*dy + dz*dz
+                    
+                    if rik_sq < Pcutoff_ik_sq
+                        rik = sqrt(rik_sq)
+                        
+                        # 如果比当前第 K 个近，尝试插入排序
+                        if rik < closest_neighbors[K][1]
+                            # 简单的插入排序逻辑
+                            for insert_pos in 1:K
+                                if rik < closest_neighbors[insert_pos][1]
+                                    # 将 insert_pos 之后的元素后移
+                                    for shift_k in K:-1:(insert_pos + 1)
+                                        closest_neighbors[shift_k] = closest_neighbors[shift_k - 1]
+                                    end
+                                    # 插入新元素
+                                    closest_neighbors[insert_pos] = (rik, i_mono)
+                                    break
+                                end
+                            end
+                        end
+                    end
+                end
+
+                # 基于找到的最近邻居计算对 Log Term 矩阵的贡献
+                # 遍历所有可能的唯一配对: C(K, 2)
+                for i in 1:(K-1)
+                    dist1, idx1 = closest_neighbors[i]
+                    if idx1 == -1; break; end # 如果第 i 个邻居无效，后面的肯定也无效
+
+                    for j in (i + 1):K
+                        dist2, idx2 = closest_neighbors[j]
+                        if idx2 == -1; break; end # 如果第 j 个邻居无效
+
+                        # 找到有效配对
+                        i_pair, j_pair = minmax(idx1, idx2)
+                        
+                        # 计算媒介概率贡献
+                        P_ik = 0.5 * (1.0 - tanh(k_c * (dist1 - r0)))
+                        P_jk = 0.5 * (1.0 - tanh(k_c * (dist2 - r0)))
+                        
+                        term = log(max(eps(Float64), 1.0 - P_ik * P_jk))
+                        log_term_matrix[i_pair, j_pair] += term
                     end
                 end
             end
-            closest_neighbors[2][2] == -1 && continue
-            
-            dist1, idx1 = closest_neighbors[1]
-            dist2, idx2 = closest_neighbors[2]
-            i_pair, j_pair = minmax(idx1, idx2)
-            
-            P_ik = 0.5 * (1.0 - tanh(k_c * (dist1 - r0)))
-            P_jk = 0.5 * (1.0 - tanh(k_c * (dist2 - r0)))
-            term = log(max(eps(Float64), 1.0 - P_ik * P_jk))
-            log_term_matrix[i_pair, j_pair] += term
+
+            # 更新下一组 bead 的起始索引
+            current_bead_start_idx += count
         end
-
-        # --- [第二部分] 处理所有 CN3 粒子 (硬编码优化) ---
-        start_index = count1 + 1
-        end_index = count1 + count2
-        initial_neighbors_N3 = ntuple(_ -> (Inf, -1), Val(3))
-        for k_bead in start_index:end_index
-            bead = free_beads[k_bead]
-            closest_neighbors = initial_neighbors_N3
-            for i_mono in 1:N
-                mono = chain[i_mono]
-                dx = mono.x - bead.x; dy = mono.y - bead.y; dz = mono.z - bead.z
-                rik_sq = dx*dx + dy*dy + dz*dz
-                if rik_sq < Pcutoff_ik_sq && rik_sq < closest_neighbors[3][1]^2
-                    rik = sqrt(rik_sq)
-                    if rik < closest_neighbors[3][1]
-                        closest_neighbors = insert_sorted_tuple_N3(closest_neighbors, rik, i_mono)
-                    end
-                end
-            end
-            closest_neighbors[2][2] == -1 && continue
-
-            # 硬编码循环范围: C(3,2) = 3 对
-            for i in 1:2
-                dist1, idx1 = closest_neighbors[i]; idx1 == -1 && break
-                for j in (i + 1):3
-                    dist2, idx2 = closest_neighbors[j]; idx2 == -1 && break
-                    i_pair, j_pair = minmax(idx1, idx2)
-
-                    P_ik = 0.5 * (1.0 - tanh(k_c * (dist1 - r0)))
-                    P_jk = 0.5 * (1.0 - tanh(k_c * (dist2 - r0)))
-                    term = log(max(eps(Float64), 1.0 - P_ik * P_jk))
-                    log_term_matrix[i_pair, j_pair] += term
-                end
-            end
-        end
-        # --- [核心优化结束] ---
 
         # 将 log-sum 矩阵转换为最终的接触概率矩阵 (不变)
         for i in 1:N
@@ -513,6 +520,8 @@ module PolymermcCPCMEM
 
         return contact_map, distance_map
     end
+
+
     # 辅助函数：检查新位置是否有效
     function is_position_valid(
         chain::Vector{Particle3D},
@@ -566,18 +575,18 @@ module PolymermcCPCMEM
         total_energy += compute_specific_interaction_energy(chain, free_beads, params)
 
         # 7. ideal chromosome term 是一个对角线上都是一个数值的alpha矩阵计算的Pij
-        if !all(iszero, params.alpha_0)
-            total_energy += ideal_chromosome_Pij(chain, params)
-        end
+        
+        total_energy += ideal_chromosome_Pij(chain, params)
+      
 
-        # 添加临时loop势
-        if !isnothing(params.loop_anchor)
-            a, b = params.loop_anchor
-            r = distance(chain[a], chain[b])
-            if r > params.loop_cutoff
-                total_energy += params.loop_strength * (r - params.loop_cutoff)^2
-            end
-        end
+        # # 添加临时loop势
+        # if !isnothing(params.loop_anchor)
+        #     a, b = params.loop_anchor
+        #     r = distance(chain[a], chain[b])
+        #     if r > params.loop_cutoff
+        #         total_energy += params.loop_strength * (r - params.loop_cutoff)^2
+        #     end
+        # end
             
         return total_energy
     end
@@ -635,40 +644,53 @@ module PolymermcCPCMEM
         energy = 0.0
         k_angle = params.k_angle  # 从参数读取键角常数
         theta0 = params.theta0_angle 
-        
-        for i in 2:length(chain)-1
-            # 计算向量
-            vec1 = [
-                chain[i-1].x - chain[i].x,
-                chain[i-1].y - chain[i].y,
-                chain[i-1].z - chain[i].z
-            ]
-            vec2 = [
-                chain[i+1].x - chain[i].x,
-                chain[i+1].y - chain[i].y,
-                chain[i+1].z - chain[i].z
-            ]
+        # theta0 = 0.5 * π
+        EPS = eps(Float64)
+
+        @inbounds for i in 2:length(chain)-1
+            p_prev = chain[i-1]
+            p_curr = chain[i]
+            p_next = chain[i+1]
+
+            # --- 不使用 [x,y,z] 数组，直接用标量 ---
             
-            # 计算向量模长并处理分母为零的情况
-            norm_vec1 = norm(vec1)
-            norm_vec2 = norm(vec2)
-            denominator = norm_vec1 * norm_vec2
+            # 向量 1: p_prev - p_curr
+            v1x = p_prev.x - p_curr.x
+            v1y = p_prev.y - p_curr.y
+            v1z = p_prev.z - p_curr.z
             
-            if denominator < eps(Float64)  # 避免除以零
-                @warn "Vectors too short or colinear at index $i, skipping angle calculation."
+            # 向量 2: p_next - p_curr
+            v2x = p_next.x - p_curr.x
+            v2y = p_next.y - p_curr.y
+            v2z = p_next.z - p_curr.z
+            
+            # 模长
+            r1 = sqrt(v1x^2 + v1y^2 + v1z^2)
+            r2 = sqrt(v2x^2 + v2y^2 + v2z^2)
+            
+            denominator = r1 * r2
+            
+            if denominator < EPS
                 continue
             end
 
-            # 计算余弦值并限制在有效范围内
-            cos_theta = dot(vec1, vec2) / denominator
-            cos_theta = clamp(cos_theta, -1.0, 1.0)  # 防止数值误差导致超出[-1,1]
+            # 点积
+            dot_val = v1x*v2x + v1y*v2y + v1z*v2z
 
-            # 计算角度差
-            theta_diff = acos(cos_theta) - theta0
-            
+            # 计算余弦并截断
+            cos_theta = dot_val / denominator
+            if cos_theta > 1.0
+                cos_theta = 1.0
+            elseif cos_theta < -1.0
+                cos_theta = -1.0
+            end
+
             # 键角能量公式
-            energy += k_angle * (1 - cos(theta_diff))
+            theta_diff = acos(cos_theta) - theta0
+            energy += k_angle * (1.0 - cos(theta_diff))
+            # --- 优化结束 ---
         end
+
         return energy
     end
 
@@ -808,107 +830,54 @@ module PolymermcCPCMEM
         return energy
     end
 
-
-    """
-        compute_specific_interaction_energy(...)
-
-    这是一个为特定场景（固定顺序的CN2-CN3混合）进行超优化的函数。
-    它假定 free_beads 数组的前 `count1` 个是CN2粒子，
-    接下来的 `count2` 个是CN3粒子。
-    """
     function compute_specific_interaction_energy(
         chain::Vector{Particle3D}, 
         free_beads::Vector{Particle3D},
         params::SimulationParameters
     )::Float64
-        # --- 1. 前置检查与参数提取 ---
-        if all(iszero, params.alpha) || !isnothing(params.loop_anchor)
-            return 0.0
-        end
+    #   这里删除了alpha 全0 的检测以及loop的检测
+
 
         N_chain = length(chain)
+        # 注意：这里我们只清空一次矩阵！
         Pij_mediated_matrix = params.Pij_mediated_matrix 
         fill!(Pij_mediated_matrix, 0.0)
 
-        Pcutoff_ik_sq = params.Pcutoff_ik^2
-        k_c = params.k_c
-        r0 = params.r0
+        # --- 2. 分发任务 ---
+        current_idx = 1
         
-        # 根据约定，我们知道 count1 是 CN2 的数量, count2 是 CN3 的数量
-        count1, count2 = params.tf_counts
-
-        # --- 2. [第一部分] 处理所有 CN2 粒子 (硬编码优化) ---
-        initial_neighbors_N2 = ntuple(_ -> (Inf, -1), Val(2))
-        for k_bead in 1:count1
-            bead = free_beads[k_bead]
-            closest_neighbors = initial_neighbors_N2
-            for i_mono in 1:N_chain
-                mono = chain[i_mono]
-                dx = mono.x - bead.x; dy = mono.y - bead.y; dz = mono.z - bead.z
-                rik_sq = dx*dx + dy*dy + dz*dz
-                if rik_sq < Pcutoff_ik_sq && rik_sq < closest_neighbors[2][1]^2
-                    rik = sqrt(rik_sq)
-                    if rik < closest_neighbors[2][1]
-                        closest_neighbors = insert_sorted_tuple_N2(closest_neighbors, rik, i_mono)
-                    end
-                end
-            end
-            for i in 1:2; params.fbead_contact[k_bead, i] = closest_neighbors[i][2]; end
-            closest_neighbors[2][2] == -1 && continue
+        # 遍历配置 (例如: counts=(50, 50), conns=(2, 6))
+        for (count, K) in zip(params.tf_counts, params.tf_connectivities)
+            if count == 0; continue; end
             
-            dist1, idx1 = closest_neighbors[1]
-            dist2, idx2 = closest_neighbors[2]
-            i_pair, j_pair = minmax(idx1, idx2)
-            if (j_pair - i_pair) >= 2
-                P_ik = 0.5 * (1.0 - tanh(k_c * (dist1 - r0)))
-                P_jk = 0.5 * (1.0 - tanh(k_c * (dist2 - r0)))
-                term = log(max(eps(Float64), 1.0 - P_ik * P_jk))
-                Pij_mediated_matrix[i_pair, j_pair] += term
+            # 确定这一批粒子的索引范围 (例如 1:50 或 51:100)
+            range_end = current_idx + count - 1
+            bead_range = current_idx:range_end
+
+            # 调用修改后的 Kernel 函数
+            if K == 2
+                _process_batch_N2!(bead_range, chain, free_beads, params)
+            elseif K == 3
+                _process_batch_N3!(bead_range, chain, free_beads, params)
+            elseif K == 4
+                _process_batch_N4!(bead_range, chain, free_beads, params)
+            elseif K == 5
+                _process_batch_N5!(bead_range, chain, free_beads, params)
+            elseif K == 6
+                _process_batch_N6!(bead_range, chain, free_beads, params)
             end
+
+            current_idx += count
         end
 
-        # --- 3. [第二部分] 处理所有 CN3 粒子 (硬编码优化) ---
-        start_index = count1 + 1
-        end_index = count1 + count2
-        initial_neighbors_N3 = ntuple(_ -> (Inf, -1), Val(3))
-        for k_bead in start_index:end_index
-            bead = free_beads[k_bead]
-            closest_neighbors = initial_neighbors_N3
-            for i_mono in 1:N_chain
-                mono = chain[i_mono]
-                dx = mono.x - bead.x; dy = mono.y - bead.y; dz = mono.z - bead.z
-                rik_sq = dx*dx + dy*dy + dz*dz
-                if rik_sq < Pcutoff_ik_sq && rik_sq < closest_neighbors[3][1]^2
-                    rik = sqrt(rik_sq)
-                    if rik < closest_neighbors[3][1]
-                        closest_neighbors = insert_sorted_tuple_N3(closest_neighbors, rik, i_mono)
-                    end
-                end
-            end
-            for i in 1:3; params.fbead_contact[k_bead, i] = closest_neighbors[i][2]; end
-            closest_neighbors[2][2] == -1 && continue
-
-            # 硬编码循环范围以获得最佳性能: C(3,2) = 3 对
-            for i in 1:2
-                dist1, idx1 = closest_neighbors[i]; idx1 == -1 && break
-                for j in (i + 1):3
-                    dist2, idx2 = closest_neighbors[j]; idx2 == -1 && break
-                    i_pair, j_pair = minmax(idx1, idx2)
-                    (j_pair - i_pair) < 2 && continue
-                    P_ik = 0.5 * (1.0 - tanh(k_c * (dist1 - r0)))
-                    P_jk = 0.5 * (1.0 - tanh(k_c * (dist2 - r0)))
-                    term = log(max(eps(Float64), 1.0 - P_ik * P_jk))
-                    Pij_mediated_matrix[i_pair, j_pair] += term
-                end
-            end
-        end
-
-        # --- 4. 最终能量计算 (不变) ---
+        # --- 3. 最终统一计算总能量 (SIMD优化) ---
         total_Pij = 0.0
         @inbounds for i in 1:N_chain
-            alpha_row = view(params.alpha, i, :); Pij_mediated_row = view(Pij_mediated_matrix, i, :)
+            alpha_row = view(params.alpha, i, :)
+            Pij_mediated_row = view(Pij_mediated_matrix, i, :)
             sum_val = 0.0
             @simd for j in (i + 2):N_chain
+                # 此时 Pij_mediated_row 包含了 N2, N6 等所有粒子的贡献总和
                 Pij_effective = 1.0 - exp(Pij_mediated_row[j])
                 sum_val += alpha_row[j] * Pij_effective
             end
@@ -1006,27 +975,29 @@ module PolymermcCPCMEM
         return (current[1], current[2], current[3], current[4], current[5], new)
     end
 
-    function _compute_pij_core_N2!(
-        chain::Vector{Particle3D}, free_beads::Vector{Particle3D}, params::SimulationParameters
-    )::Float64
+    function _process_batch_N2!(
+        bead_range::UnitRange{Int}, 
+        chain::Vector{Particle3D}, 
+        free_beads::Vector{Particle3D}, 
+        params::SimulationParameters
+    )
+
         N_MAX_C = 2
-        N_chain = length(chain)
-        NB = length(free_beads)
-        total_Pij = 0.0
+        N_chain = length(chain) # 必须定义，否则循环报错
+        
+
         Pij_mediated_matrix = params.Pij_mediated_matrix 
-        fill!(Pij_mediated_matrix, 0.0)
 
         Pcutoff_ik_sq = params.Pcutoff_ik^2
         k_c = params.k_c
         r0 = params.r0
 
-        initial_neighbors = ntuple(_ -> (Inf, -1), Val(N_MAX_C))
+        initial_neighbors = ((Inf, -1), (Inf, -1))
 
-        for k_bead in 1:NB
+        for k_bead in bead_range
             bead = free_beads[k_bead]
             closest_neighbors = initial_neighbors
 
-            # --- High-performance neighbor search using Tuples ---
             for i_mono in 1:N_chain
                 mono = chain[i_mono]
                 dx = mono.x - bead.x; dy = mono.y - bead.y; dz = mono.z - bead.z
@@ -1040,16 +1011,13 @@ module PolymermcCPCMEM
                 end
             end
 
-            # Update contact matrix
             params.fbead_contact[k_bead, 1] = closest_neighbors[1][2]
             params.fbead_contact[k_bead, 2] = closest_neighbors[2][2]
             
-            # If we didn't find at least two neighbors, continue
             if closest_neighbors[2][2] == -1
                 continue
             end
 
-            # --- Simplified Pairing Logic for N=2 (only one pair) ---
             dist1, idx1 = closest_neighbors[1]
             dist2, idx2 = closest_neighbors[2]
 
@@ -1065,29 +1033,20 @@ module PolymermcCPCMEM
                 @inbounds Pij_mediated_matrix[i_pair, j_pair] += term
             end
         end
-
-        # Final energy calculation (identical to all other versions)
-        @inbounds for i in 1:N_chain
-            alpha_row = view(params.alpha, i, :); Pij_mediated_row = view(Pij_mediated_matrix, i, :)
-            sum_val = 0.0
-            @simd for j in (i + 2):N_chain
-                Pij_effective = 1.0 - exp(Pij_mediated_row[j])
-                sum_val += alpha_row[j] * Pij_effective
-            end
-            total_Pij += sum_val
-        end
-        return total_Pij
+        return nothing
     end
 
-    function _compute_pij_core_N3!(
-        chain::Vector{Particle3D}, free_beads::Vector{Particle3D}, params::SimulationParameters
-    )::Float64
+    function _process_batch_N3!(
+        bead_range::UnitRange{Int}, # 新增参数
+        chain::Vector{Particle3D}, 
+        free_beads::Vector{Particle3D}, 
+        params::SimulationParameters
+    )
         N_MAX_C = 3
         N_chain = length(chain)
-        NB = length(free_beads)
-        total_Pij = 0.0
+        
+        # 不要清零矩阵
         Pij_mediated_matrix = params.Pij_mediated_matrix 
-        fill!(Pij_mediated_matrix, 0.0)
 
         Pcutoff_ik_sq = params.Pcutoff_ik^2
         k_c = params.k_c
@@ -1095,7 +1054,7 @@ module PolymermcCPCMEM
 
         initial_neighbors = ntuple(_ -> (Inf, -1), Val(N_MAX_C))
 
-        for k_bead in 1:NB
+        for k_bead in bead_range # 修改循环范围
             bead = free_beads[k_bead]
             closest_neighbors = initial_neighbors
 
@@ -1118,7 +1077,7 @@ module PolymermcCPCMEM
             
             closest_neighbors[2][2] == -1 && continue
 
-            # 编译器将完全展开这个双重循环 (只有3个配对)
+            # N=3 特定逻辑 C(3,2)
             for i in 1:(N_MAX_C-1)
                 dist1, idx1 = closest_neighbors[i]; idx1 == -1 && break
                 for j in (i + 1):N_MAX_C
@@ -1136,29 +1095,18 @@ module PolymermcCPCMEM
                 end
             end
         end
-
-        # 总能量计算部分与 N=4,5,6 版本完全一致
-        @inbounds for i in 1:N_chain
-            alpha_row = view(params.alpha, i, :); Pij_mediated_row = view(Pij_mediated_matrix, i, :)
-            sum_val = 0.0
-            @simd for j in (i + 2):N_chain
-                Pij_effective = 1.0 - exp(Pij_mediated_row[j])
-                sum_val += alpha_row[j] * Pij_effective
-            end
-            total_Pij += sum_val
-        end
-        return total_Pij
+        return nothing
     end
 
-    function _compute_pij_core_N4!(
-        chain::Vector{Particle3D}, free_beads::Vector{Particle3D}, params::SimulationParameters
-    )::Float64
+    function _process_batch_N4!(
+        bead_range::UnitRange{Int}, 
+        chain::Vector{Particle3D}, 
+        free_beads::Vector{Particle3D}, 
+        params::SimulationParameters
+    )
         N_MAX_C = 4
         N_chain = length(chain)
-        NB = length(free_beads)
-        total_Pij = 0.0
         Pij_mediated_matrix = params.Pij_mediated_matrix 
-        fill!(Pij_mediated_matrix, 0.0)
 
         Pcutoff_ik_sq = params.Pcutoff_ik^2
         k_c = params.k_c
@@ -1166,7 +1114,7 @@ module PolymermcCPCMEM
 
         initial_neighbors = ntuple(_ -> (Inf, -1), Val(N_MAX_C))
 
-        for k_bead in 1:NB
+        for k_bead in bead_range
             bead = free_beads[k_bead]
             closest_neighbors = initial_neighbors
 
@@ -1183,6 +1131,7 @@ module PolymermcCPCMEM
                 end
             end
 
+            # Unroll saving contacts
             params.fbead_contact[k_bead, 1] = closest_neighbors[1][2]
             params.fbead_contact[k_bead, 2] = closest_neighbors[2][2]
             params.fbead_contact[k_bead, 3] = closest_neighbors[3][2]
@@ -1190,7 +1139,6 @@ module PolymermcCPCMEM
             
             closest_neighbors[2][2] == -1 && continue
 
-            # 编译器将完全展开这个双重循环
             for i in 1:(N_MAX_C-1)
                 dist1, idx1 = closest_neighbors[i]; idx1 == -1 && break
                 for j in (i + 1):N_MAX_C
@@ -1208,28 +1156,18 @@ module PolymermcCPCMEM
                 end
             end
         end
-
-        @inbounds for i in 1:N_chain
-            alpha_row = view(params.alpha, i, :); Pij_mediated_row = view(Pij_mediated_matrix, i, :)
-            sum_val = 0.0
-            @simd for j in (i + 2):N_chain
-                Pij_effective = 1.0 - exp(Pij_mediated_row[j])
-                sum_val += alpha_row[j] * Pij_effective
-            end
-            total_Pij += sum_val
-        end
-        return total_Pij
+        return nothing
     end
 
-    function _compute_pij_core_N5!(
-        chain::Vector{Particle3D}, free_beads::Vector{Particle3D}, params::SimulationParameters
-    )::Float64
+    function _process_batch_N5!(
+        bead_range::UnitRange{Int}, 
+        chain::Vector{Particle3D}, 
+        free_beads::Vector{Particle3D}, 
+        params::SimulationParameters
+    )
         N_MAX_C = 5
         N_chain = length(chain)
-        NB = length(free_beads)
-        total_Pij = 0.0
         Pij_mediated_matrix = params.Pij_mediated_matrix 
-        fill!(Pij_mediated_matrix, 0.0)
 
         Pcutoff_ik_sq = params.Pcutoff_ik^2
         k_c = params.k_c
@@ -1237,7 +1175,7 @@ module PolymermcCPCMEM
 
         initial_neighbors = ntuple(_ -> (Inf, -1), Val(N_MAX_C))
 
-        for k_bead in 1:NB
+        for k_bead in bead_range
             bead = free_beads[k_bead]
             closest_neighbors = initial_neighbors
 
@@ -1279,28 +1217,18 @@ module PolymermcCPCMEM
                 end
             end
         end
-
-        @inbounds for i in 1:N_chain
-            alpha_row = view(params.alpha, i, :); Pij_mediated_row = view(Pij_mediated_matrix, i, :)
-            sum_val = 0.0
-            @simd for j in (i + 2):N_chain
-                Pij_effective = 1.0 - exp(Pij_mediated_row[j])
-                sum_val += alpha_row[j] * Pij_effective
-            end
-            total_Pij += sum_val
-        end
-        return total_Pij
+        return nothing
     end
 
-    function _compute_pij_core_N6!(
-        chain::Vector{Particle3D}, free_beads::Vector{Particle3D}, params::SimulationParameters
-    )::Float64
+    function _process_batch_N6!(
+        bead_range::UnitRange{Int}, 
+        chain::Vector{Particle3D}, 
+        free_beads::Vector{Particle3D}, 
+        params::SimulationParameters
+    )
         N_MAX_C = 6
         N_chain = length(chain)
-        NB = length(free_beads)
-        total_Pij = 0.0
         Pij_mediated_matrix = params.Pij_mediated_matrix 
-        fill!(Pij_mediated_matrix, 0.0)
 
         Pcutoff_ik_sq = params.Pcutoff_ik^2
         k_c = params.k_c
@@ -1308,7 +1236,7 @@ module PolymermcCPCMEM
 
         initial_neighbors = ntuple(_ -> (Inf, -1), Val(N_MAX_C))
 
-        for k_bead in 1:NB
+        for k_bead in bead_range
             bead = free_beads[k_bead]
             closest_neighbors = initial_neighbors
 
@@ -1351,18 +1279,9 @@ module PolymermcCPCMEM
                 end
             end
         end
-
-        @inbounds for i in 1:N_chain
-            alpha_row = view(params.alpha, i, :); Pij_mediated_row = view(Pij_mediated_matrix, i, :)
-            sum_val = 0.0
-            @simd for j in (i + 2):N_chain
-                Pij_effective = 1.0 - exp(Pij_mediated_row[j])
-                sum_val += alpha_row[j] * Pij_effective
-            end
-            total_Pij += sum_val
-        end
-        return total_Pij
+        return nothing
     end
+
 
     function ideal_chromosome_Pij(
         chain::Vector{Particle3D}, 
@@ -1421,16 +1340,26 @@ module PolymermcCPCMEM
         current_energy::Float64,
         current_temperature::Float64
     )::Tuple{Int, Float64}
+        N = length(chain)
         i = rand(1:length(chain))
         # 保存旧坐标（链和自由粒子）
-        old_chain = deepcopy(chain)
-        old_free_beads = deepcopy(free_beads)
+        # 1. 【记录】只保存当前被移动的单体的旧坐标
+        # Particle3D 是 immutable struct，赋值即为值拷贝，非常快
+        old_monomer_pos = chain[i]
         
-        # 保存被移动的自由粒子的旧坐标
-        moved_beads = []
-        for k in 1:length(free_beads)
-            if params.fbead_contact[k, 1] == i 
-                push!(moved_beads, (k, free_beads[k]))
+        # 2. 【记录】查找并保存受影响的自由粒子的旧坐标
+        # 使用轻量级的 Vector{Tuple} 来存储，避免 Any 类型
+        # 大多数情况下 moved_beads 的长度为 0 或 1，开销极小
+        moved_beads_backup = Vector{Tuple{Int, Particle3D}}()
+        
+        NB = length(free_beads)
+        if NB > 0
+            # 这里的逻辑保留你原代码的意图：
+            # 如果自由粒子 "挂" 在当前移动的单体 i 上 (contact[k,1] == i)，则随之移动
+            for k in 1:NB
+                if params.fbead_contact[k, 1] == i
+                    push!(moved_beads_backup, (k, free_beads[k]))
+                end
             end
         end
         
@@ -1438,13 +1367,10 @@ module PolymermcCPCMEM
         dy = params.DD * (2rand() - 1)
         dz = params.DD * (2rand() - 1)
         
-        p = chain[i]
-        chain[i] = Particle3D(p.x + dx, p.y +dy, p.z + dz)
-
-
+        chain[i] = Particle3D(old_monomer_pos.x + dx, old_monomer_pos.y + dy, old_monomer_pos.z + dz)
 
         # 移动关联的自由粒子并记录
-        for (k, old_bead) in moved_beads
+        for (k, old_bead) in moved_beads_backup
             free_beads[k] = Particle3D(
                 old_bead.x + dx,
                 old_bead.y + dy,
@@ -1458,8 +1384,13 @@ module PolymermcCPCMEM
         if metropolis_accept(ΔE, current_temperature)
             return (1, new_energy)
         else
-            chain[:] = old_chain
-            free_beads[:] = old_free_beads
+            # 7. 【回滚】拒绝：恢复旧坐标
+            chain[i] = old_monomer_pos
+            
+            for (k, old_bead) in moved_beads_backup
+                free_beads[k] = old_bead
+            end
+
             return (0, current_energy)
         end
     end
@@ -1474,7 +1405,8 @@ module PolymermcCPCMEM
         # 随机选择一个枢轴点
         # current_energy = compute_total_energy!(chain, free_beads, params)
         pivot = rand(1:length(chain)-1)  # 枢轴点不能是链的最后一个单体
-        
+        N = length(chain)
+
         # 随机生成旋转角度和轴
         θ = rand() * π  # 旋转角度 [0, π]
         axis = normalize([randn(), randn(), randn()])  # 随机旋转轴（归一化）
@@ -2067,6 +1999,552 @@ module PolymermcCPCMEM
     end
 
 
+    # ==============================================================================
+    # 优化性能
+    # ==============================================================================
+
+    # 计算一个 Bead 的所有相关数据：Contacts 和 Matrix Contributions
+    function analyze_bead!(
+        k::Int, 
+        bead_pos::Particle3D, 
+        chain::Vector{Particle3D}, 
+        params::SimulationParameters,
+        # 缓存容器
+        buf_pairs::Vector{Tuple{Int, Int, Float64}}, 
+        buf_contacts::Vector{Int}
+    )
+        get_bead_interactions!(k, bead_pos, chain, params, buf_pairs, buf_contacts)
+    end
+
+    # 单体移动的高性能版
+    function mcdiff_fast!(
+        chain::Vector{Particle3D},
+        free_beads::Vector{Particle3D},
+        params::SimulationParameters,
+        current_total_E::Float64,
+        T::Float64
+    )::Tuple{Int, Float64} # 返回 (Accepted, NewTotalEnergy)
+        
+        N = length(chain)
+        i = rand(1:N)
+        old_pos = chain[i]
+        
+        # 1. 试探移动 (生成新坐标，但暂时不更新 chain)
+        dx = params.DD * (2rand() - 1)
+        dy = params.DD * (2rand() - 1)
+        dz = params.DD * (2rand() - 1)
+        new_pos = Particle3D(old_pos.x + dx, old_pos.y + dy, old_pos.z + dz)
+        
+        # 2. 识别所有受影响的 Beads
+        # 只要 Beads 的旧位置或新位置在截断范围内，就需要更新
+        affected_indices = Int[]
+        NB = length(free_beads)
+        Pcut_sq = params.Pcutoff_ik^2
+        
+        for k in 1:NB
+            b = free_beads[k]
+            dist_old_sq = (b.x - old_pos.x)^2 + (b.y - old_pos.y)^2 + (b.z - old_pos.z)^2
+            dist_new_sq = (b.x - new_pos.x)^2 + (b.y - new_pos.y)^2 + (b.z - new_pos.z)^2
+            
+            should_update = false
+            # 几何判断
+            if dist_old_sq < Pcut_sq || dist_new_sq < Pcut_sq
+                should_update = true
+            else
+                # 拓扑判断：如果原来就连接在这个单体上
+                # 注意：params.fbead_contact 的列数取决于最大连接数
+                for c_idx in view(params.fbead_contact, k, :)
+                    if c_idx == i
+                        should_update = true
+                        break
+                    end
+                end
+            end
+            
+            if should_update
+                push!(affected_indices, k)
+            end
+        end
+        
+        # 3. 准备缓存 (在循环外分配，极重要！)
+        # 假设最大连接数为 6，Pair 数 C(6,2)=15
+        _buf_pairs = Vector{Tuple{Int, Int, Float64}}(); sizehint!(_buf_pairs, 15)
+        _buf_contacts = zeros(Int, 6)
+        
+        # 保存旧贡献 (用于回滚和计算 Delta)
+        # old_contribs[j] 对应 affected_indices[j] 的旧 Pair 数据
+        old_contribs = Vector{Vector{Tuple{Int, Int, Float64}}}(undef, length(affected_indices))
+        
+        # 4. 计算旧的 Specific Energy 贡献 (Chain 仍为 Old)
+        for (idx, k) in enumerate(affected_indices)
+            get_bead_interactions!(k, free_beads[k], chain, params, _buf_pairs, _buf_contacts)
+            old_contribs[idx] = copy(_buf_pairs) # 必须 Copy
+        end
+        
+        # 5. 计算 Standard Energy Delta (Old)
+        E_std_old = compute_local_standard_energy(i, old_pos, chain, params)
+        
+        # === 状态变更 ===
+        chain[i] = new_pos
+        # ================
+        
+        # 6. 计算新的 Specific Energy 贡献并累积 Delta
+        # 我们需要保存新贡献以便在接受时不做处理，或在拒绝时移除
+        new_contribs = Vector{Vector{Tuple{Int, Int, Float64}}}(undef, length(affected_indices))
+        new_contacts_list = Vector{Vector{Int}}(undef, length(affected_indices))
+        
+        M = params.Pij_mediated_matrix
+        Alpha = params.alpha
+        delta_spec = 0.0
+        
+        for (idx, k) in enumerate(affected_indices)
+            get_bead_interactions!(k, free_beads[k], chain, params, _buf_pairs, _buf_contacts)
+            new_contribs[idx] = copy(_buf_pairs)
+            new_contacts_list[idx] = copy(_buf_contacts) # 保存新连接关系，用于更新 fbead_contact
+            
+            # --- 增量更新 Matrix 和 Energy ---
+            
+            # A. 移除旧贡献
+            for (u, v, term) in old_contribs[idx]
+                old_M = M[u, v]
+                M[u, v] -= term
+                new_M = M[u, v]
+                # E = alpha * (1 - exp(M))
+                # Delta = E_new - E_old = alpha * (exp(M_old) - exp(M_new))
+                delta_spec += Alpha[u, v] * (exp(old_M) - exp(new_M))
+            end
+            
+            # B. 添加新贡献
+            for (u, v, term) in new_contribs[idx]
+                old_M = M[u, v]
+                M[u, v] += term
+                new_M = M[u, v]
+                delta_spec += Alpha[u, v] * (exp(old_M) - exp(new_M))
+            end
+        end
+        
+        # 7. 计算 Standard Energy Delta (New)
+        E_std_new = compute_local_standard_energy(i, new_pos, chain, params)
+        
+        # 8. 总能量判定
+        delta_total = (E_std_new - E_std_old) + delta_spec
+        
+        if metropolis_accept(delta_total, T)
+            # --- 接受 ---
+            
+            # Matrix M 已经被更新到位了，无需额外操作。
+            
+            # 更新 fbead_contact 表
+            for (idx, k) in enumerate(affected_indices)
+                contacts = new_contacts_list[idx]
+                # 能够安全地填入，因为 _buf_contacts 大小固定
+                # 注意：如果 contacts 中含有 -1，也要填入
+                for ci in eachindex(contacts)
+                    if ci <= size(params.fbead_contact, 2)
+                        params.fbead_contact[k, ci] = contacts[ci]
+                    end
+                end
+            end
+            
+            return 1, current_total_E + delta_total
+        else
+            # --- 拒绝：回滚 ---
+            
+            # 1. 恢复 Chain
+            chain[i] = old_pos
+            
+            # 2. 回滚 Matrix M
+            # 反向操作：移除 New，加回 Old
+            for (idx, k) in enumerate(affected_indices)
+                # 撤销新贡献
+                for (u, v, term) in new_contribs[idx]
+                    M[u, v] -= term 
+                end
+                # 恢复旧贡献
+                for (u, v, term) in old_contribs[idx]
+                    M[u, v] += term 
+                end
+            end
+            
+            return 0, current_total_E
+        end
+    end
+
+    # ==============================================================================
+    # 3. 辅助函数
+    # ==============================================================================
+
+    function get_bead_interactions!(
+        bead_idx::Int,
+        bead_pos::Particle3D,
+        chain::Vector{Particle3D},
+        params::SimulationParameters,
+        # 输出容器
+        out_pairs::Vector{Tuple{Int, Int, Float64}}, 
+        out_contacts::Vector{Int}
+    )
+        empty!(out_pairs)
+        
+        # 1. 确定 K
+        count1, count2 = params.tf_counts
+        conn1, conn2 = params.tf_connectivities
+        K = (bead_idx <= count1) ? conn1 : conn2
+
+        # 2. 分发到专用内核
+        if K == 2
+            _kernel_N2!(bead_pos, chain, params, out_pairs, out_contacts)
+        elseif K == 3
+            _kernel_N3!(bead_pos, chain, params, out_pairs, out_contacts)
+        elseif K == 4
+            _kernel_N4!(bead_pos, chain, params, out_pairs, out_contacts)
+        elseif K == 5
+            _kernel_N5!(bead_pos, chain, params, out_pairs, out_contacts)
+        elseif K == 6
+            _kernel_N6!(bead_pos, chain, params, out_pairs, out_contacts)
+        end
+    end
+
+    # --- Kernel for K=2 ---
+    function _kernel_N2!(
+        pos::Particle3D, chain::Vector{Particle3D}, params::SimulationParameters,
+        out_pairs::Vector{Tuple{Int, Int, Float64}}, out_contacts::Vector{Int}
+    )
+        # 初始化 Tuple: ((r^2, idx), ...)
+        best = ( (Inf, -1), (Inf, -1) )
+        Pcut_sq = params.Pcutoff_ik^2
+        bx, by, bz = pos.x, pos.y, pos.z
+
+        # 1. 极速搜索
+        @inbounds for i in 1:length(chain)
+            p = chain[i]
+            dx, dy, dz = p.x - bx, p.y - by, p.z - bz
+            r_sq = dx*dx + dy*dy + dz*dz
+            
+            # 比较距离平方。注意：best[2] 是当前第 2 大的
+            if r_sq < Pcut_sq && r_sq < best[2][1]
+                best = insert_sorted_tuple_N2(best, r_sq, i)
+            end
+        end
+
+        # 2. 填充 Contacts (确保 out_contacts 足够大)
+        fill!(out_contacts, -1) 
+        out_contacts[1], out_contacts[2] = best[1][2], best[2][2]
+
+        # 3. 计算能量 (只有在找到足够邻居时)
+        if best[2][2] != -1
+            # 在这里才进行开方运算
+            _compute_pairs_generic!(best, 2, params, out_pairs)
+        end
+    end
+
+    # --- Kernel for K=3 ---
+    function _kernel_N3!(
+        pos::Particle3D, chain::Vector{Particle3D}, params::SimulationParameters,
+        out_pairs::Vector{Tuple{Int, Int, Float64}}, out_contacts::Vector{Int}
+    )
+        best = ( (Inf, -1), (Inf, -1), (Inf, -1) )
+        Pcut_sq = params.Pcutoff_ik^2
+        bx, by, bz = pos.x, pos.y, pos.z
+
+        @inbounds for i in 1:length(chain)
+            p = chain[i]
+            r_sq = (p.x-bx)^2 + (p.y-by)^2 + (p.z-bz)^2
+            
+            if r_sq < Pcut_sq && r_sq < best[3][1]
+                best = insert_sorted_tuple_N3(best, r_sq, i)
+            end
+        end
+
+
+        fill!(out_contacts, -1)
+        out_contacts[1], out_contacts[2], out_contacts[3] = best[1][2], best[2][2], best[3][2]
+
+        if best[2][2] != -1 # 至少需要2个邻居才能形成Pair
+            _compute_pairs_generic!(best, 3, params, out_pairs)
+        end
+    end
+
+    # --- Kernel for K=4 ---
+    function _kernel_N4!(
+        pos::Particle3D, chain::Vector{Particle3D}, params::SimulationParameters,
+        out_pairs::Vector{Tuple{Int, Int, Float64}}, out_contacts::Vector{Int}
+    )
+        best = ( (Inf, -1), (Inf, -1), (Inf, -1), (Inf, -1) )
+        Pcut_sq = params.Pcutoff_ik^2
+        bx, by, bz = pos.x, pos.y, pos.z
+
+        @inbounds for i in 1:length(chain)
+            p = chain[i]
+            r_sq = (p.x-bx)^2 + (p.y-by)^2 + (p.z-bz)^2
+            if r_sq < Pcut_sq && r_sq < best[4][1]
+                best = insert_sorted_tuple_N4(best, r_sq, i)
+            end
+        end
+
+        fill!(out_contacts, -1)
+        for k in 1:4; out_contacts[k] = best[k][2]; end
+
+        if best[2][2] != -1
+            _compute_pairs_generic!(best, 4, params, out_pairs)
+        end
+    end
+
+    # --- Kernel for K=5 ---
+    function _kernel_N5!(
+        pos::Particle3D, chain::Vector{Particle3D}, params::SimulationParameters,
+        out_pairs::Vector{Tuple{Int, Int, Float64}}, out_contacts::Vector{Int}
+    )
+        best = ( (Inf, -1), (Inf, -1), (Inf, -1), (Inf, -1), (Inf, -1) )
+        Pcut_sq = params.Pcutoff_ik^2
+        bx, by, bz = pos.x, pos.y, pos.z
+
+        @inbounds for i in 1:length(chain)
+            p = chain[i]
+            r_sq = (p.x-bx)^2 + (p.y-by)^2 + (p.z-bz)^2
+            if r_sq < Pcut_sq && r_sq < best[5][1]
+                best = insert_sorted_tuple_N5(best, r_sq, i)
+            end
+        end
+
+        fill!(out_contacts, -1)
+        for k in 1:5; out_contacts[k] = best[k][2]; end
+
+        if best[2][2] != -1
+            _compute_pairs_generic!(best, 5, params, out_pairs)
+        end
+    end
+
+    # --- Kernel for K=6 ---
+    function _kernel_N6!(
+        pos::Particle3D, chain::Vector{Particle3D}, params::SimulationParameters,
+        out_pairs::Vector{Tuple{Int, Int, Float64}}, out_contacts::Vector{Int}
+    )
+        best = ( (Inf, -1), (Inf, -1), (Inf, -1), (Inf, -1), (Inf, -1), (Inf, -1) )
+        Pcut_sq = params.Pcutoff_ik^2
+        bx, by, bz = pos.x, pos.y, pos.z
+
+        @inbounds for i in 1:length(chain)
+            p = chain[i]
+            r_sq = (p.x-bx)^2 + (p.y-by)^2 + (p.z-bz)^2
+            if r_sq < Pcut_sq && r_sq < best[6][1]
+                best = insert_sorted_tuple_N6(best, r_sq, i)
+            end
+        end
+
+        fill!(out_contacts, -1)
+        for k in 1:6; out_contacts[k] = best[k][2]; end
+
+        if best[2][2] != -1
+            _compute_pairs_generic!(best, 6, params, out_pairs)
+        end
+    end
+    @inline function _compute_pairs_generic!(
+        best_tuple::Tuple, 
+        K::Int, 
+        params::SimulationParameters, 
+        out_pairs::Vector{Tuple{Int, Int, Float64}}
+    )
+        k_c = params.k_c
+        r0 = params.r0
+
+        # 外层循环: 第一个点
+        for a in 1:(K-1)
+            item_a = best_tuple[a]
+            idx_a = item_a[2]
+            if idx_a == -1 break end 
+            dist_a = sqrt(item_a[1]) # 此时才开方
+
+            # 内层循环: 第二个点
+            for b in (a+1):K
+                item_b = best_tuple[b]
+                idx_b = item_b[2]
+                if idx_b == -1 break end
+                dist_b = sqrt(item_b[1]) 
+
+                i_pair, j_pair = minmax(idx_a, idx_b)
+                
+                # 物理限制
+                if (j_pair - i_pair) >= 2
+                    P_ik = 0.5 * (1.0 - tanh(k_c * (dist_a - r0)))
+                    P_jk = 0.5 * (1.0 - tanh(k_c * (dist_b - r0)))
+                    
+                    term = log(max(eps(Float64), 1.0 - P_ik * P_jk))
+                    push!(out_pairs, (i_pair, j_pair, term))
+                end
+            end
+        end
+    end
+
+    # ==============================================================================
+    # 优化后的局部能量计算函数
+    # ==============================================================================
+
+    """
+    只计算与单个粒子 index 相关的 Bond, Angle, LJ, Wall 能量。
+    不包含 FreeBeads 和 Specific Interaction (因为它们涉及全局排序，需单独处理)。
+    """
+    function compute_local_standard_energy(
+        idx::Int, 
+        p_new::Particle3D, 
+        chain::Vector{Particle3D}, 
+        params::SimulationParameters
+    )::Float64
+        E = 0.0
+        N = length(chain)
+
+        # 1. Bond Energy (涉及 i-1 和 i, 以及 i 和 i+1)
+        # 注意：如果 idx=1，没有 i-1；如果 idx=N，没有 i+1
+        if idx > 1
+            E += bond_pair_energy(chain[idx-1], p_new, params)
+        end
+        if idx < N
+            E += bond_pair_energy(p_new, chain[idx+1], params)
+        end
+
+        # 2. Angle Energy (涉及 idx-1, idx, idx+1 三元组，以及以 idx 为端点的角)
+        # Case A: idx 是中心 (idx-1, idx, idx+1)
+        if idx > 1 && idx < N
+            E += angle_triplet_energy(chain[idx-1], p_new, chain[idx+1], params)
+        end
+        # Case B: idx 是右端点 (idx-2, idx-1, idx)
+        if idx > 2
+            E += angle_triplet_energy(chain[idx-2], chain[idx-1], p_new, params)
+        end
+        # Case C: idx 是左端点 (idx, idx+1, idx+2)
+        if idx < N - 1
+            E += angle_triplet_energy(p_new, chain[idx+1], chain[idx+2], params)
+        end
+
+        # 3. Wall Interaction
+        E += wall_particle_energy(p_new, params)
+
+        # 4. Chain Non-bonded (LJ) - O(N) instead of O(N^2)
+        # 只计算 p_new 与链上其他粒子的相互作用
+        E += lj_particle_chain_energy(idx, p_new, chain, params)
+
+        # # 5. Ideal Chromosome (Alpha_0)
+        # # 类似 LJ，只计算 p_new 与其他粒子的对
+        # if !all(iszero, params.alpha_0)
+        #     E += ideal_chrom_particle_energy(idx, p_new, chain, params)
+        # end
+
+        return E
+    end
+
+    # --- 辅助微观能量函数 (Inline 以提高速度) ---
+
+    @inline function bond_pair_energy(p1::Particle3D, p2::Particle3D, params::SimulationParameters)
+        dist_sq = (p1.x-p2.x)^2 + (p1.y-p2.y)^2 + (p1.z-p2.z)^2
+        dist = sqrt(dist_sq)
+        # Morse Potential
+        k, De, r0 = params.k_bond, params.De_bond, params.r0_bond
+        a = sqrt(k / (2.0 * De))
+        val = 1.0 - exp(-a * (dist - r0))
+        return De * val^2
+    end
+
+    @inline function angle_triplet_energy(p1::Particle3D, p2::Particle3D, p3::Particle3D, params::SimulationParameters)
+        v1x, v1y, v1z = p1.x - p2.x, p1.y - p2.y, p1.z - p2.z
+        v2x, v2y, v2z = p3.x - p2.x, p3.y - p2.y, p3.z - p2.z
+        
+        dot_prod = v1x*v2x + v1y*v2y + v1z*v2z
+        norm1 = sqrt(v1x^2 + v1y^2 + v1z^2)
+        norm2 = sqrt(v2x^2 + v2y^2 + v2z^2)
+        
+        denom = norm1 * norm2
+        if denom < 1e-12 return 0.0 end
+        
+        cos_theta = clamp(dot_prod / denom, -1.0, 1.0)
+        theta_diff = acos(cos_theta) - params.theta0_angle # theta0 已经是弧度
+        return params.k_angle * (1.0 - cos(theta_diff))
+    end
+
+    @inline function wall_particle_energy(p::Particle3D, params::SimulationParameters)
+        # Rc assumed [0,0,0]
+        r_center = sqrt(p.x^2 + p.y^2 + p.z^2)
+        Rw = params.R_wall
+        r_np = r_center - Rw
+        
+        if r_np >= 0 # Outside or on boundary
+            return 0.5 * 1.0 * r_np^6 # ε=1.0
+        end
+        
+        # Inside
+        r_np_abs = abs(r_np)
+        σ = params.r0_bond
+        cutoff = σ * 1.122462 # 2^(1/6)
+        
+        if r_np_abs <= cutoff
+            inv_r = σ / r_np_abs
+            inv_r6 = inv_r^6
+            return 4.0 * 1.0 * (inv_r6^2 - inv_r6 + 0.25)
+        end
+        return 0.0
+    end
+
+    @inline function lj_particle_chain_energy(idx::Int, p::Particle3D, chain::Vector{Particle3D}, params::SimulationParameters)
+        ε = params.lj_epsilon
+        if ε == 0.0 return 0.0 end
+        
+        E = 0.0
+        σ = params.lj_sigma
+        cutoff_sq = params.lj_cutoff^2
+        lj_range = params.lj_range
+        
+        # Shift energy constants
+        inv_cut2 = 1.0 / cutoff_sq
+        inv_cut6 = inv_cut2^3
+        shift = 4.0 * ε * (inv_cut6^2 - inv_cut6)
+        
+        N = length(chain)
+        # Loop limits based on lj_range
+        start_j = max(1, idx - lj_range)
+        end_j = min(N, idx + lj_range)
+        
+        @inbounds for j in start_j:end_j
+            # Skip self and neighbors involved in bonds (usually |i-j| > 1 or 2 depending on physics)
+            # Assuming 1-2 and 1-3 exclusion handled by bond/angle, standard LJ often excludes |i-j| <= 2?
+            # Your original code used: start_j = i + 2. Let's keep consistency: exclude |i-j| <= 1
+            if abs(idx - j) < 2 continue end 
+
+            pj = chain[j]
+            dx, dy, dz = p.x - pj.x, p.y - pj.y, p.z - pj.z
+            r_sq = dx^2 + dy^2 + dz^2
+            
+            if r_sq < cutoff_sq
+                inv_r2 = 1.0 / r_sq
+                inv_r6 = inv_r2^3
+                E += 4.0 * ε * (inv_r6^2 - inv_r6) - shift
+            end
+        end
+        return E
+    end
+
+    @inline function ideal_chrom_particle_energy(idx::Int, p::Particle3D, chain::Vector{Particle3D}, params::SimulationParameters)
+        E = 0.0
+        kc, r0 = params.ideal_chrom_kc, params.ideal_chrom_r0
+        alpha_0 = params.alpha_0
+        
+        # 只计算涉及 idx 的对
+        # 注意：alpha_0 通常是对称的，或者只定义了上三角。
+        # 这里我们扫描所有 j，除了 idx 本身和近邻（如果 ideal model 排除近邻的话，原代码是 j in i+2:N）
+        
+        N = length(chain)
+        @inbounds for j in 1:N
+            if abs(idx - j) < 2 continue end # 保持一致性，排除近邻
+            
+            # 获取 alpha_0 值，处理对称性
+            val_alpha = (idx < j) ? alpha_0[idx, j] : alpha_0[j, idx]
+            if val_alpha == 0.0 continue end
+
+            pj = chain[j]
+            dist = sqrt((p.x-pj.x)^2 + (p.y-pj.y)^2 + (p.z-pj.z)^2)
+            Pij = 0.5 * (1.0 - tanh(kc * (dist - r0)))
+            E += val_alpha * Pij
+        end
+        return E
+    end
+
     # 修改后的接触矩阵计算函数
     function calculate_contacts(chains, params, cutoff::Real)
         N = params.N
@@ -2165,10 +2643,11 @@ module PolymermcCPCMEM
         end
 
         current_energy = compute_total_energy!(chain, free_beads, params)
-        move_functions = (mcdiff!, mcdiff_free_bead!, mcpivot!, mcdoublepivot!, freebead_snake!, mcloop_extrusion!)
-
+        move_functions = (mcdiff!, mcdiff_free_bead!, mcpivot!, mcdoublepivot!, freebead_snake!)
+        
+        # move_functions = (mcdiff_fast!, mcdiff_free_bead!, mcpivot!, mcdoublepivot!, freebead_snake!)
         # 移动权重
-        move_weights = [100, 100, 20, 20, 5, 1]
+        move_weights = [100, 100, 20, 20, 5]
         cumulative_weights = cumsum(move_weights)
         total_weight = cumulative_weights[end]
 
@@ -2202,7 +2681,7 @@ module PolymermcCPCMEM
                 
                 output_step = step - equilibration_steps
                 energy_str = join([@sprintf("%.4f", e) for e in energy_out], " ")
-                push!(output_buffer, @sprintf("%d %d %s %.4f\n", worker_id, output_step, energy_str, mean_coord_num))
+                push!(output_buffer, @sprintf("%d %d %s %.4f", worker_id, output_step, energy_str, mean_coord_num))
             end
         end
         
@@ -2269,7 +2748,7 @@ module PolymermcCPCMEM
                 # 物理参数 (映射 config -> struct)
                 lj_epsilon = phys_conf["lj_epsilon"],
                 k_angle = phys_conf["k_angle"],
-                theta0_angle = phys_conf["theta0_angle"] * π,
+                theta0_angle = phys_conf["theta0_angle_pai"] * π,
 
                 lj_range = phys_conf["lj_range"],
                 r0_bond = phys_conf["r0_bond"],
@@ -2350,7 +2829,9 @@ module PolymermcCPCMEM
         end
 
         for t in Step_start:maxiter
-            println("\n--- Stage 2, Iteration: $t ---")
+            iter_start_time = time() # 获取高精度时间戳用于计算耗时
+            start_dt = Dates.now()   # 获取当前日期时间用于显示
+            println("\n--- Iteration: $t --- Start Time: $(Dates.format(start_dt, "yyyy-mm-dd HH:MM:SS"))")
 
             # 1. 保存当前 alpha
             save_contact_map(alpha, joinpath(output_dir, "alpha_log", "$t.txt"))
@@ -2373,10 +2854,17 @@ module PolymermcCPCMEM
             end
             loss = denominator ≈ 0.0 ? 0.0 : numerator / denominator
             correlation = cor(sim_vals, target_vals)
+            
+            # 2. 获取当前时间戳 (建议使用下划线连接，保持列的完整性)
+            timestamp_str = Dates.format(Dates.now(), "yyyy-mm-dd_HH:MM:SS")
+            current_duration = time() - iter_start_time
+
 
             println("Loss: $loss, Correlation: $correlation")
+            # 3. 写入文件
             open(joinpath(output_dir, "loss.dat"), "a") do io
-                println(io, t, " ", loss, " ", correlation)
+                # 输出格式: Iteration | Loss | Correlation | Duration(s) | Timestamp
+                println(io, t, " ", loss, " ", correlation, " ", round(current_duration, digits=2), " ", timestamp_str)
             end
             save_contact_map(simulated_contact, joinpath(output_dir, "contacts", "$t.txt"))
 
@@ -2406,6 +2894,7 @@ module PolymermcCPCMEM
             open(joinpath(output_dir, "alpha_0_log.txt"), "a") do io
                 println(io, t, " ", join(round.(alpha_0[1, 2:end], digits=6), " "))
             end
+            
         end
         
         println("Optimization finished.")
