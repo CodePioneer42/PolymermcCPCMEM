@@ -234,17 +234,64 @@ module PolymermcCPCMEM
         return sqrt(dx^2 + dy^2 + dz^2)
     end
 
-    # 检查新位置是否满足最小距离要求
-    function is_position_valid(chain::Vector{Particle3D}, new_x::Float64, new_y::Float64, new_z::Float64, min_distance::Float64)::Bool
-        for particle in chain
-            if compute_distance(particle.x, particle.y, particle.z, new_x, new_y, new_z) < min_distance
-                return false
-            end
-        end
-        return true
+# 计算距离的平方，避免昂贵的 sqrt
+    @inline function compute_distance_sq(a::Particle3D, b::Particle3D)::Float64
+        return (a.x - b.x)^2 + (a.y - b.y)^2 + (a.z - b.z)^2
     end
 
 
+    # # 检查新位置是否满足最小距离要求
+    # function is_position_valid(chain::Vector{Particle3D}, new_x::Float64, new_y::Float64, new_z::Float64, min_distance::Float64)::Bool
+    #     for particle in chain
+    #         if compute_distance(particle.x, particle.y, particle.z, new_x, new_y, new_z) < min_distance
+    #             return false
+    #         end
+    #     end
+    #     return true
+    # end
+    
+    # # # 检查新位置是否满足最小距离要求
+    # function is_position_valid(chain::Vector{Particle3D}, free_beads::Vector{Particle3D}, 
+    #                         new_x::Float64, new_y::Float64, new_z::Float64, min_distance::Float64)::Bool
+    #     # 检查链上的粒子
+    #     for particle in chain
+    #         if compute_distance(particle.x, particle.y, particle.z, new_x, new_y, new_z) < min_distance
+    #             return false
+    #         end
+    #     end
+        
+    #     # 检查其他自由粒子
+    #     for bead in free_beads
+    #         if compute_distance(bead.x, bead.y, bead.z, new_x, new_y, new_z) < min_distance
+    #             return false
+    #         end
+    #     end
+        
+    #     return true
+    # end
+
+    # # 辅助函数：检查新位置是否有效
+    # function is_position_valid(
+    #     chain::Vector{Particle3D},
+    #     free_beads::Vector{Particle3D},
+    #     min_distance::Float64
+    # )::Bool
+    #     # 检查链内距离
+    #     for i in 1:length(chain), j in i+1:length(chain)
+    #         if compute_distance(chain[i], chain[j]) < min_distance
+    #             return false
+    #         end
+    #     end
+        
+    #     # 检查与自由粒子的距离
+    #     for bead in free_beads, particle in chain
+    #         if compute_distance(bead, particle) < min_distance
+    #             return false
+    #         end
+    #     end
+        
+    #     return true
+    # end
 
     function initialize_free_beads(NB::Int, chain::Vector{Particle3D}, min_distance::Float64, box_size::Float64)::Vector{Particle3D}
         if NB == -1
@@ -274,24 +321,85 @@ module PolymermcCPCMEM
         
         return free_beads
     end
+# 检查新位置是否满足最小距离要求 (用于初始化或单粒子移动检查)
+    function is_position_valid(
+        chain::Vector{Particle3D}, 
+        free_beads::Vector{Particle3D}, 
+        new_x::Float64, new_y::Float64, new_z::Float64, 
+        min_distance::Float64
+    )::Bool
+        # 1. 预计算距离平方阈值，避免后续开方
+        min_dist_sq = min_distance^2
 
-    # 检查新位置是否满足最小距离要求
-    function is_position_valid(chain::Vector{Particle3D}, free_beads::Vector{Particle3D}, 
-                            new_x::Float64, new_y::Float64, new_z::Float64, min_distance::Float64)::Bool
         # 检查链上的粒子
-        for particle in chain
-            if compute_distance(particle.x, particle.y, particle.z, new_x, new_y, new_z) < min_distance
+        @inbounds for p in chain
+            dx = p.x - new_x
+            dy = p.y - new_y
+            dz = p.z - new_z
+            dist_sq = dx*dx + dy*dy + dz*dz
+            
+            if dist_sq < min_dist_sq
                 return false
             end
         end
         
         # 检查其他自由粒子
-        for bead in free_beads
-            if compute_distance(bead.x, bead.y, bead.z, new_x, new_y, new_z) < min_distance
+        @inbounds for b in free_beads
+            dx = b.x - new_x
+            dy = b.y - new_y
+            dz = b.z - new_z
+            dist_sq = dx*dx + dy*dy + dz*dz
+            
+            if dist_sq < min_dist_sq
                 return false
             end
         end
         
+        return true
+    end
+
+# 辅助函数：检查新位置是否有效 (针对 Free Beads 移动)
+    function is_position_valid(
+        chain::Vector{Particle3D},
+        free_beads::Vector{Particle3D},
+        min_distance::Float64
+    )::Bool
+        min_distance_sq = min_distance^2 # 预计算平方阈值
+
+        # 检查链内距离 (如果链不刚性移动，这部分其实在 FreeBead Move 中可以省略，
+        # 但为保持通用性，我们优化它)
+        for i in 1:length(chain), j in i+1:length(chain)
+            if compute_distance_sq(chain[i], chain[j]) < min_distance_sq
+                return false
+            end
+        end
+        
+        # 检查与自由粒子的距离
+        for bead in free_beads, particle in chain
+            if compute_distance_sq(bead, particle) < min_distance_sq
+                return false
+            end
+        end
+        
+        # 自由粒子之间的距离检查 (原代码似乎漏了，如果需要也加上)
+        # for i in 1:length(free_beads), j in i+1:length(free_beads)
+        #     if compute_distance_sq(free_beads[i], free_beads[j]) < min_distance_sq
+        #         return false
+        #     end
+        # end
+        
+        return true
+    end
+
+    # 针对生成链时的新位置验证函数
+    function is_position_valid(chain::Vector{Particle3D}, new_x::Float64, new_y::Float64, new_z::Float64, min_distance::Float64)::Bool
+        min_distance_sq = min_distance^2
+        new_p = Particle3D(new_x, new_y, new_z)
+        for particle in chain
+            if compute_distance_sq(particle, new_p) < min_distance_sq
+                return false
+            end
+        end
         return true
     end
     
@@ -409,20 +517,19 @@ module PolymermcCPCMEM
         end
 
         # 2. 根据模型计算接触概率图
-        total_N_B = sum(params.tf_counts)
+        total_N_B = params.tf_counts[1]
 
         # 如果没有TF粒子，则直接返回
         if total_N_B <= 0
-            # (可选：保留对旧的NB=-1模型的兼容性)
-            if isdefined(params, :N_B) && params.N_B == -1
-                k_c = params.calculate_contacts_kc
-                r0 = params.calculate_contacts_r0
-                for i in 1:N, j in i+1:N
-                    r = distance_map[i, j]
-                    Pij = 0.5 * (1.0 - tanh(k_c * (r - r0)))
-                    contact_map[i, j] = contact_map[j, i] = Pij
-                end
+            
+            k_c = params.calculate_contacts_kc
+            r0 = params.calculate_contacts_r0
+            for i in 1:N, j in i+1:N
+                r = distance_map[i, j]
+                Pij = 0.5 * (1.0 - tanh(k_c * (r - r0)))
+                contact_map[i, j] = contact_map[j, i] = Pij
             end
+
             return contact_map, distance_map
         end
         
@@ -522,28 +629,6 @@ module PolymermcCPCMEM
     end
 
 
-    # 辅助函数：检查新位置是否有效
-    function is_position_valid(
-        chain::Vector{Particle3D},
-        free_beads::Vector{Particle3D},
-        min_distance::Float64
-    )::Bool
-        # 检查链内距离
-        for i in 1:length(chain), j in i+1:length(chain)
-            if compute_distance(chain[i], chain[j]) < min_distance
-                return false
-            end
-        end
-        
-        # 检查与自由粒子的距离
-        for bead in free_beads, particle in chain
-            if compute_distance(bead, particle) < min_distance
-                return false
-            end
-        end
-        
-        return true
-    end
 
 
     # 总能量函数
@@ -576,7 +661,7 @@ module PolymermcCPCMEM
 
         # 7. ideal chromosome term 是一个对角线上都是一个数值的alpha矩阵计算的Pij
         
-        total_energy += ideal_chromosome_Pij(chain, params)
+        # total_energy += ideal_chromosome_Pij(chain, params)
       
 
         # # 添加临时loop势
@@ -837,6 +922,9 @@ module PolymermcCPCMEM
     )::Float64
     #   这里删除了alpha 全0 的检测以及loop的检测
 
+        if params.tf_counts[1] == -1
+           return compute_total_Pij_IJ(chain, free_beads, params)
+        end
 
         N_chain = length(chain)
         # 注意：这里我们只清空一次矩阵！
@@ -893,7 +981,6 @@ module PolymermcCPCMEM
         free_beads::Vector{Particle3D},
         params::SimulationParameters
     )::Float64
-        params.N_B != -1 && return 0.0  # 提前返回
 
         N = length(chain)
         total_Pij = 0.0
@@ -1395,97 +1482,172 @@ module PolymermcCPCMEM
         end
     end
 
-    function mcpivot!(
+    # function mcpivot!(
+    #     chain::Vector{Particle3D},
+    #     free_beads::Vector{Particle3D},
+    #     params::SimulationParameters,
+    #     current_energy::Float64,
+    #     current_temperature::Float64
+    # )::Tuple{Int, Float64}
+    #     # 随机选择一个枢轴点
+    #     # current_energy = compute_total_energy!(chain, free_beads, params)
+    #     pivot = rand(1:length(chain)-1)  # 枢轴点不能是链的最后一个单体
+    #     N = length(chain)
+
+    #     # 随机生成旋转角度和轴
+    #     θ = rand() * π  # 旋转角度 [0, π]
+    #     axis = normalize([randn(), randn(), randn()])  # 随机旋转轴（归一化）
+        
+    #     # 创建旋转矩阵
+    #     rotation_matrix = compute_rotation_matrix(axis, θ)
+        
+    #     # 保存旧坐标（链和自由粒子）
+    #     old_chain = deepcopy(chain)
+    #     old_free_beads = deepcopy(free_beads)
+        
+    #     # 获取枢轴点的坐标
+    #     pivot_coords = [chain[pivot].x, chain[pivot].y, chain[pivot].z]
+    #     N_max_c = maximum(params.tf_connectivities)
+    #     # 旋转移动：仅旋转枢轴点之后的部分
+    #     for i in (pivot+1):length(chain)
+    #         # 将单体相对于枢轴点平移到原点
+    #         relative_coords = [
+    #             chain[i].x - pivot_coords[1],
+    #             chain[i].y - pivot_coords[2],
+    #             chain[i].z - pivot_coords[3]
+    #         ]
+            
+    #         # 应用旋转矩阵
+    #         rotated_coords = rotation_matrix * relative_coords
+            
+    #         # 平移回原始位置
+    #         chain[i] = Particle3D(
+    #             rotated_coords[1] + pivot_coords[1],
+    #             rotated_coords[2] + pivot_coords[2],
+    #             rotated_coords[3] + pivot_coords[3]
+    #         )
+    #     end
+        
+    #     # 同时旋转与受影响单体相关的自由粒子
+    #     for k in 1:length(free_beads)
+    #         bead = free_beads[k]
+            
+    #         # 检查该自由粒子是否与枢轴点之后的单体相关
+    #         for idx in 1:N_max_c
+    #             monomer_idx = params.fbead_contact[k, idx]
+    #             if monomer_idx > pivot && monomer_idx != -1
+    #                 # 将自由粒子相对于枢轴点平移到原点
+    #                 relative_coords = [
+    #                     bead.x - pivot_coords[1],
+    #                     bead.y - pivot_coords[2],
+    #                     bead.z - pivot_coords[3]
+    #                 ]
+                    
+    #                 # 应用旋转矩阵
+    #                 rotated_coords = rotation_matrix * relative_coords
+                    
+    #                 # 平移回原始位置
+    #                 free_beads[k] = Particle3D(
+    #                     rotated_coords[1] + pivot_coords[1],
+    #                     rotated_coords[2] + pivot_coords[2],
+    #                     rotated_coords[3] + pivot_coords[3]
+    #                 )
+                    
+    #                 # 每个自由粒子只需旋转一次
+    #                 break
+    #             end
+    #         end
+    #     end
+        
+    #     # 计算能量变化（仅计算受影响的能量项）
+    #     new_energy = compute_total_energy!(chain, free_beads, params)
+    #     ΔE = new_energy - current_energy
+        
+    #     # Metropolis 判据
+    #     if metropolis_accept(ΔE, current_temperature)
+    #         return (1, new_energy)  # 接受移动
+    #     else
+    #         chain[:] = old_chain
+    #         free_beads[:] = old_free_beads
+    #         return (0, current_energy)  # 拒绝移动
+    #     end
+    # end
+
+function mcpivot!(
         chain::Vector{Particle3D},
         free_beads::Vector{Particle3D},
         params::SimulationParameters,
         current_energy::Float64,
         current_temperature::Float64
     )::Tuple{Int, Float64}
-        # 随机选择一个枢轴点
-        # current_energy = compute_total_energy!(chain, free_beads, params)
-        pivot = rand(1:length(chain)-1)  # 枢轴点不能是链的最后一个单体
+        
         N = length(chain)
-
-        # 随机生成旋转角度和轴
-        θ = rand() * π  # 旋转角度 [0, π]
-        axis = normalize([randn(), randn(), randn()])  # 随机旋转轴（归一化）
+        pivot = rand(1:N-1) 
         
-        # 创建旋转矩阵
-        rotation_matrix = compute_rotation_matrix(axis, θ)
+        axis = normalize(SVector(randn(), randn(), randn()))
+        θ = rand() * π
         
-        # 保存旧坐标（链和自由粒子）
-        old_chain = deepcopy(chain)
-        old_free_beads = deepcopy(free_beads)
+        # 2. 【优化】计算旋转矩阵 (返回 SMatrix)
+        Rot = compute_rotation_matrix(axis, θ)
         
-        # 获取枢轴点的坐标
-        pivot_coords = [chain[pivot].x, chain[pivot].y, chain[pivot].z]
+        old_chain_tail = chain[pivot+1:end] # 这里会有一次 copy，但比 loop 里每次 copy 好
+        
+        # 找出受影响的 beads
+        affected_bead_indices = Int[]
+        old_beads_backup = Particle3D[]
         N_max_c = maximum(params.tf_connectivities)
-        # 旋转移动：仅旋转枢轴点之后的部分
-        for i in (pivot+1):length(chain)
-            # 将单体相对于枢轴点平移到原点
-            relative_coords = [
-                chain[i].x - pivot_coords[1],
-                chain[i].y - pivot_coords[2],
-                chain[i].z - pivot_coords[3]
-            ]
-            
-            # 应用旋转矩阵
-            rotated_coords = rotation_matrix * relative_coords
-            
-            # 平移回原始位置
-            chain[i] = Particle3D(
-                rotated_coords[1] + pivot_coords[1],
-                rotated_coords[2] + pivot_coords[2],
-                rotated_coords[3] + pivot_coords[3]
-            )
-        end
         
-        # 同时旋转与受影响单体相关的自由粒子
         for k in 1:length(free_beads)
-            bead = free_beads[k]
-            
-            # 检查该自由粒子是否与枢轴点之后的单体相关
+            is_affected = false
             for idx in 1:N_max_c
                 monomer_idx = params.fbead_contact[k, idx]
                 if monomer_idx > pivot && monomer_idx != -1
-                    # 将自由粒子相对于枢轴点平移到原点
-                    relative_coords = [
-                        bead.x - pivot_coords[1],
-                        bead.y - pivot_coords[2],
-                        bead.z - pivot_coords[3]
-                    ]
-                    
-                    # 应用旋转矩阵
-                    rotated_coords = rotation_matrix * relative_coords
-                    
-                    # 平移回原始位置
-                    free_beads[k] = Particle3D(
-                        rotated_coords[1] + pivot_coords[1],
-                        rotated_coords[2] + pivot_coords[2],
-                        rotated_coords[3] + pivot_coords[3]
-                    )
-                    
-                    # 每个自由粒子只需旋转一次
+                    is_affected = true
                     break
                 end
             end
+            if is_affected
+                push!(affected_bead_indices, k)
+                push!(old_beads_backup, free_beads[k])
+            end
+        end
+
+        # --- 开始旋转 (无内存分配循环) ---
+        p_piv = chain[pivot]
+        pivot_pos = SVector(p_piv.x, p_piv.y, p_piv.z)
+
+        # 旋转链
+        @inbounds for i in (pivot+1):N
+            p = chain[i]
+            pos = SVector(p.x, p.y, p.z)
+            # 核心优化：StaticArrays 矩阵乘法，无堆内存分配
+            new_pos = pivot_pos + Rot * (pos - pivot_pos)
+            chain[i] = Particle3D(new_pos[1], new_pos[2], new_pos[3])
         end
         
-        # 计算能量变化（仅计算受影响的能量项）
+        # 旋转 Beads
+        @inbounds for k in affected_bead_indices
+            b = free_beads[k]
+            pos = SVector(b.x, b.y, b.z)
+            new_pos = pivot_pos + Rot * (pos - pivot_pos)
+            free_beads[k] = Particle3D(new_pos[1], new_pos[2], new_pos[3])
+        end
+        
+        # 计算能量
         new_energy = compute_total_energy!(chain, free_beads, params)
         ΔE = new_energy - current_energy
         
-        # Metropolis 判据
         if metropolis_accept(ΔE, current_temperature)
-            return (1, new_energy)  # 接受移动
+            return (1, new_energy)
         else
-            chain[:] = old_chain
-            free_beads[:] = old_free_beads
-            return (0, current_energy)  # 拒绝移动
+            # 回滚
+            chain[pivot+1:end] = old_chain_tail
+            for (i, k) in enumerate(affected_bead_indices)
+                free_beads[k] = old_beads_backup[i]
+            end
+            return (0, current_energy)
         end
     end
-
 
     function mcdiff_free_bead!(
         chain::Vector{Particle3D},
@@ -1901,21 +2063,105 @@ module PolymermcCPCMEM
     end
 
 
-    function mcdoublepivot!(
+    # function mcdoublepivot!(
+    #     chain::Vector{Particle3D},
+    #     free_beads::Vector{Particle3D},
+    #     params::SimulationParameters,
+    #     current_energy::Float64,
+    #     current_temperature::Float64
+    # )::Tuple{Int, Float64}
+    #     # current_energy = compute_total_energy!(chain, free_beads, params)
+    #     # Step 1: 随机选择两个有效枢纽点
+    #     a, b = 0, 0
+    #     valid = false
+    #     N = length(chain)
+    #     for _ in 1:100  # 防止无限循环
+    #         a = rand(1:N-2)
+    #         b = rand(a+2:N)  # 确保至少有一个中间单体
+    #         if b <= N && (b - a) >= 2
+    #             valid = true
+    #             break
+    #         end
+    #     end
+    #     !valid && return (0, current_energy)
+
+    #     # Step 2: 计算旋转轴（基于a到b的向量）
+    #     vec_ab = [chain[b].x - chain[a].x,
+    #             chain[b].y - chain[a].y,
+    #             chain[b].z - chain[a].z]
+    #     if norm(vec_ab) < 1e-8  # 防止零向量
+    #         return (0, current_energy)
+    #     end
+    #     axis = normalize(vec_ab)
+    #     θ = 2π * rand()  # 完整旋转范围[0, 2π]
+
+    #     # 构建旋转矩阵（使用Rodrigues公式）
+    #     rotation_matrix = compute_rotation_matrix(axis, θ)
+
+    #     # 保存旧状态
+    #     old_chain = deepcopy(chain)
+    #     old_free_beads = deepcopy(free_beads)
+    #     a_coords = [chain[a].x, chain[a].y, chain[a].z]
+
+    #     # Step 3: 旋转中间区域
+    #     for i in (a+1):(b-1)
+    #         rel_pos = [chain[i].x - a_coords[1],
+    #                 chain[i].y - a_coords[2],
+    #                 chain[i].z - a_coords[3]]
+    #         rot_pos = rotation_matrix * rel_pos
+    #         chain[i] = Particle3D(
+    #             rot_pos[1] + a_coords[1],
+    #             rot_pos[2] + a_coords[2],
+    #             rot_pos[3] + a_coords[3]
+    #         )
+    #     end
+
+    #     # Step 4: 更新关联的free beads
+    #     for fb in 1:length(free_beads)
+    #         for j in 1:1
+    #             m_idx = params.fbead_contact[fb, j]
+    #             if m_idx in (a+1):(b-1)
+    #                 rel_pos = [free_beads[fb].x - a_coords[1],
+    #                         free_beads[fb].y - a_coords[2],
+    #                         free_beads[fb].z - a_coords[3]]
+    #                 rot_pos = rotation_matrix * rel_pos
+    #                 free_beads[fb] = Particle3D(
+    #                     rot_pos[1] + a_coords[1],
+    #                     rot_pos[2] + a_coords[2],
+    #                     rot_pos[3] + a_coords[3]
+    #                 )
+    #                 break
+    #             end
+    #         end
+    #     end
+
+    #     # Step 5: 能量计算和判据
+    #     new_energy = compute_total_energy!(chain, free_beads, params)
+    #     ΔE = new_energy - current_energy
+
+    #     if metropolis_accept(ΔE, current_temperature)
+    #         return (1, new_energy)
+    #     else
+    #         chain[:] = old_chain
+    #         free_beads[:] = old_free_beads
+    #         return (0, current_energy)
+    #     end
+    # end
+function mcdoublepivot!(
         chain::Vector{Particle3D},
         free_beads::Vector{Particle3D},
         params::SimulationParameters,
         current_energy::Float64,
         current_temperature::Float64
     )::Tuple{Int, Float64}
-        # current_energy = compute_total_energy!(chain, free_beads, params)
-        # Step 1: 随机选择两个有效枢纽点
+
+        N = length(chain)
+        # Step 1: 选择点 (保持不变)
         a, b = 0, 0
         valid = false
-        N = length(chain)
-        for _ in 1:100  # 防止无限循环
+        for _ in 1:100
             a = rand(1:N-2)
-            b = rand(a+2:N)  # 确保至少有一个中间单体
+            b = rand(a+2:N)
             if b <= N && (b - a) >= 2
                 valid = true
                 break
@@ -1923,81 +2169,107 @@ module PolymermcCPCMEM
         end
         !valid && return (0, current_energy)
 
-        # Step 2: 计算旋转轴（基于a到b的向量）
-        vec_ab = [chain[b].x - chain[a].x,
-                chain[b].y - chain[a].y,
-                chain[b].z - chain[a].z]
-        if norm(vec_ab) < 1e-8  # 防止零向量
+        # Step 2: 计算轴 (使用 SVector)
+        p_a = chain[a]
+        p_b = chain[b]
+        vec_ab = SVector(p_b.x - p_a.x, p_b.y - p_a.y, p_b.z - p_a.z)
+        
+        if norm(vec_ab) < 1e-8
             return (0, current_energy)
         end
+        
         axis = normalize(vec_ab)
-        θ = 2π * rand()  # 完整旋转范围[0, 2π]
+        θ = 2π * rand()
 
-        # 构建旋转矩阵（使用Rodrigues公式）
-        rotation_matrix = compute_rotation_matrix(axis, θ)
+        Rot = compute_rotation_matrix(axis, θ)
 
-        # 保存旧状态
-        old_chain = deepcopy(chain)
-        old_free_beads = deepcopy(free_beads)
-        a_coords = [chain[a].x, chain[a].y, chain[a].z]
-
-        # Step 3: 旋转中间区域
-        for i in (a+1):(b-1)
-            rel_pos = [chain[i].x - a_coords[1],
-                    chain[i].y - a_coords[2],
-                    chain[i].z - a_coords[3]]
-            rot_pos = rotation_matrix * rel_pos
-            chain[i] = Particle3D(
-                rot_pos[1] + a_coords[1],
-                rot_pos[2] + a_coords[2],
-                rot_pos[3] + a_coords[3]
-            )
-        end
-
-        # Step 4: 更新关联的free beads
-        for fb in 1:length(free_beads)
-            for j in 1:1
-                m_idx = params.fbead_contact[fb, j]
-                if m_idx in (a+1):(b-1)
-                    rel_pos = [free_beads[fb].x - a_coords[1],
-                            free_beads[fb].y - a_coords[2],
-                            free_beads[fb].z - a_coords[3]]
-                    rot_pos = rotation_matrix * rel_pos
-                    free_beads[fb] = Particle3D(
-                        rot_pos[1] + a_coords[1],
-                        rot_pos[2] + a_coords[2],
-                        rot_pos[3] + a_coords[3]
-                    )
+        # 备份
+        # Double pivot 只影响 a+1 到 b-1 之间的部分，通常很短
+        # 所以这里由 copy 产生的开销很小
+        range_idx = (a+1):(b-1)
+        old_segment = chain[range_idx]
+        
+        affected_bead_indices = Int[]
+        old_beads_backup = Particle3D[]
+        # 注意：这里简单假设只要连在区间内就动。逻辑需与你原代码一致。
+        for k in 1:length(free_beads)
+            # 这里简化逻辑：只要有一个接触点在区间内，就受影响
+            # 你原来的逻辑是 `for j in 1:1 ... break`，看起来只检查第一个接触点？
+            # 我这里保留严谨性：检查所有接触点
+            is_affected = false
+            for j in 1:size(params.fbead_contact, 2)
+                m_idx = params.fbead_contact[k, j]
+                if m_idx in range_idx
+                    is_affected = true
                     break
                 end
             end
+            if is_affected
+                push!(affected_bead_indices, k)
+                push!(old_beads_backup, free_beads[k])
+            end
         end
 
-        # Step 5: 能量计算和判据
+        # Step 3: 旋转 (SMatrix, 零分配)
+        origin = SVector(p_a.x, p_a.y, p_a.z)
+        
+        @inbounds for i in range_idx
+            p = chain[i]
+            pos = SVector(p.x, p.y, p.z)
+            new_pos = origin + Rot * (pos - origin)
+            chain[i] = Particle3D(new_pos[1], new_pos[2], new_pos[3])
+        end
+
+        @inbounds for k in affected_bead_indices
+            b = free_beads[k]
+            pos = SVector(b.x, b.y, b.z)
+            new_pos = origin + Rot * (pos - origin)
+            free_beads[k] = Particle3D(new_pos[1], new_pos[2], new_pos[3])
+        end
+
+        # Step 5: 能量
         new_energy = compute_total_energy!(chain, free_beads, params)
         ΔE = new_energy - current_energy
 
         if metropolis_accept(ΔE, current_temperature)
             return (1, new_energy)
         else
-            chain[:] = old_chain
-            free_beads[:] = old_free_beads
+            chain[range_idx] = old_segment
+            for (i, k) in enumerate(affected_bead_indices)
+                free_beads[k] = old_beads_backup[i]
+            end
             return (0, current_energy)
         end
     end
 
-    # Rodrigues旋转矩阵计算公式
-    function compute_rotation_matrix(axis::Vector{Float64}, θ::Float64)
-        u = normalize(axis)
-        ux, uy, uz = u
+
+    # # Rodrigues旋转矩阵计算公式
+    # function compute_rotation_matrix(axis::Vector{Float64}, θ::Float64)
+    #     u = normalize(axis)
+    #     ux, uy, uz = u
+    #     cosθ = cos(θ)
+    #     sinθ = sin(θ)
+        
+    #     [cosθ + ux^2*(1-cosθ)      ux*uy*(1-cosθ) - uz*sinθ   ux*uz*(1-cosθ) + uy*sinθ;
+    #     uy*ux*(1-cosθ) + uz*sinθ  cosθ + uy^2*(1-cosθ)       uy*uz*(1-cosθ) - ux*sinθ;
+    #     uz*ux*(1-cosθ) - uy*sinθ  uz*uy*(1-cosθ) + ux*sinθ   cosθ + uz^2*(1-cosθ)]
+    # end
+
+    # Rodrigues旋转矩阵计算公式 (高性能版)
+    function compute_rotation_matrix(axis::SVector{3, Float64}, θ::Float64)
+        # axis 已经是归一化的 SVector
+        ux, uy, uz = axis
         cosθ = cos(θ)
         sinθ = sin(θ)
-        
-        [cosθ + ux^2*(1-cosθ)      ux*uy*(1-cosθ) - uz*sinθ   ux*uz*(1-cosθ) + uy*sinθ;
-        uy*ux*(1-cosθ) + uz*sinθ  cosθ + uy^2*(1-cosθ)       uy*uz*(1-cosθ) - ux*sinθ;
-        uz*ux*(1-cosθ) - uy*sinθ  uz*uy*(1-cosθ) + ux*sinθ   cosθ + uz^2*(1-cosθ)]
-    end
+        c1 = 1 - cosθ
 
+        # 使用 @SMatrix 宏构建静态矩阵 (零分配)
+        return @SMatrix [
+            cosθ + ux^2*c1        ux*uy*c1 - uz*sinθ    ux*uz*c1 + uy*sinθ;
+            uy*ux*c1 + uz*sinθ    cosθ + uy^2*c1        uy*uz*c1 - ux*sinθ;
+            uz*ux*c1 - uy*sinθ    uz*uy*c1 + ux*sinθ    cosθ + uz^2*c1
+        ]
+    end
 
     # ==============================================================================
     # 优化性能
@@ -2674,8 +2946,7 @@ module PolymermcCPCMEM
                     compute_chain_nonbond_energy(chain, params), 
                     compute_wall_interaction(chain,params), 
                     compute_free_bead_energy(free_beads, params), 
-                    compute_specific_interaction_energy(chain, free_beads, params),
-                    ideal_chromosome_Pij(chain, params)
+                    compute_specific_interaction_energy(chain, free_beads, params)
                 ]
                 mean_coord_num = calculate_mean_coordination_number(chain, params.coord_num_threshold)
                 
@@ -2721,10 +2992,14 @@ module PolymermcCPCMEM
         tf_connectivities = Tuple(sim_conf["tf_connectivities"])
         
         # 计算 connectivity_map
-        connectivity_map = vcat(
-            fill(tf_connectivities[1], tf_counts[1]),
-            fill(tf_connectivities[2], tf_counts[2])
-        )
+        if tf_counts[1] == -1
+            connectivity_map = Int[]
+        else
+            connectivity_map = vcat(
+                fill(tf_connectivities[1], tf_counts[1]),
+                fill(tf_connectivities[2], tf_counts[2])
+            )
+        end
         
         # 2. 确定并行运行次数
         parallel_runs = config["parallel"]["runs_per_iter"]

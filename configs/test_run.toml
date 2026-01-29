@@ -1,6 +1,6 @@
 [experiment]
 name = "Stage2_Opt_Run1"
-output_dir = "sim_out/run_009"
+output_dir = "sim_out/run_011"
 
 [input]
 hic_data = "data/hic_data.dat"
@@ -23,7 +23,7 @@ steps_final = 2_000_000   # 2e6
 num_samples = 500
 # TF 配置: (TypeA, TypeB)
 tf_counts = [40, 8]       
-tf_connectivities = [2, 3]
+tf_connectivities = [2, 6]
 
 [simulation.physics]
 # 基础物理参数
