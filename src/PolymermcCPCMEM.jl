@@ -81,7 +81,7 @@ module PolymermcCPCMEM
         loop_strength::Float64 = 1e5
         loop_cutoff::Float64 = 0.3
         loop_anchor::Union{Nothing,Tuple{Int,Int}} = nothing
-        factor_effective_cutoff_Pcutoff_ik::Float64 = 1.0
+        factor_effective_cutoff_Pcutoff_ik::Float64 = 0.74
     end
 
     struct Particle3D
@@ -832,52 +832,135 @@ module PolymermcCPCMEM
     function compute_free_bead_energy(free_beads::Vector{Particle3D}, params::SimulationParameters)::Float64
         energy = 0.0
         
-        # 假设 σ 是基础长度单位，我们可以直接定义它。
-        # 例如，我们可以从 params 中获取 σ，或者在这里为了演示而设定一个。
-        # 为了与您之前的代码兼容，我们继续从 r_min 推导 σ。
+        # r_min 是粒子"接触"的平衡距离 (势能最低点)
+        # 设置为 1.0
         r_min = params.factor_effective_cutoff_Pcutoff_ik * params.Pcutoff_ik
-        ε = params.free_bead_LJ_ε  
+        # ε = params.free_bead_LJ_ε  
         σ = r_min / (2.0^(1.0/6.0))
-
-        # **关键改动**: 选择一个更大的截断距离，典型的选择是 2.5σ
-        cutoff_lj = 2.5 * σ
-        cutoff_lj_sq = cutoff_lj^2
-
-        # LJ 参数
+        σ_sq = σ^2
         σ_pow6 = σ^6
-        
-        four_ε = 4.0 * ε
 
-        # **关键改动**: 计算在新的、更大的截断距离 cutoff_lj 处的LJ势能值，作为平移量
-        # V_LJ(r_c) = 4ε * [ (σ/r_c)^12 - (σ/r_c)^6 ]
-        term_at_cutoff = σ_pow6 / (cutoff_lj^6)
-        V_lj_at_cutoff = four_ε * (term_at_cutoff^2 - term_at_cutoff)
 
-        for i in 1:length(free_beads)
-            for j in i+1:length(free_beads)
+        # 2. 判断模式：是"纯排斥"还是"吸引+排斥"？
+        input_epsilon = params.free_bead_LJ_ε
+
+        # 初始化计算参数
+        local_epsilon::Float64 = 0.0
+        cutoff_sq::Float64 = 0.0
+        shift_value::Float64 = 0.0
+
+    
+        if input_epsilon < 1e-6
+            # === 模式 A: 纯排斥 (WCA Potential) ===
+            # 原来的模拟应该用这个！
+            # 即使没有吸引力，我们也需要一个 epsilon 来定义粒子的"硬度"
+            # 通常设为 1.0 kT，保证粒子不会重叠
+            local_epsilon = 1.0  
+            
+            # 截断在势能最低点 (2^(1/6) * σ)，只保留排斥部分
+            cutoff_dist = r_min 
+            cutoff_sq = cutoff_dist^2
+            
+            # WCA 势在 cutoff 处本身就是 -epsilon，为了连续性，我们通常加 epsilon 使其为 0
+            # V_WCA(r_min) = -epsilon. Shift = -(-epsilon) = epsilon.
+            shift_value = -local_epsilon 
+            
+        else
+            # === 模式 B: 相分离 (Full Lennard-Jones) ===
+            local_epsilon = input_epsilon
+            
+            # 截断在 2.5 倍 σ，包含吸引拖尾
+            cutoff_dist = 2.5 * σ
+            cutoff_sq = cutoff_dist^2
+            
+            # 计算 Cutoff 处的势能值用于平移 (Shifted Potential)
+            # V(r_c) = 4ε * [ (σ/r_c)^12 - (σ/r_c)^6 ]
+            ratio_sq = σ_sq / cutoff_sq
+            ratio_6 = ratio_sq^3
+            ratio_12 = ratio_6^2
+            V_at_cutoff = 4.0 * local_epsilon * (ratio_12 - ratio_6)
+            
+            shift_value = V_at_cutoff
+        end
+
+        four_eps = 4.0 * local_epsilon
+
+        # 3. 循环计算能量
+        N = length(free_beads)
+        for i in 1:N
+            for j in i+1:N
                 dx = free_beads[i].x - free_beads[j].x
                 dy = free_beads[i].y - free_beads[j].y
                 dz = free_beads[i].z - free_beads[j].z
                 r_sq = dx^2 + dy^2 + dz^2
                 
-                # 使用新的截断距离进行判断
-                if r_sq < cutoff_lj_sq
-                    r_pow6 = r_sq^3
-                    term = σ_pow6 / r_pow6
+                if r_sq < cutoff_sq
+                    # 优化计算: 避免开方，直接用平方的幂
+                    # (σ/r)^6 = (σ^2 / r^2)^3
+                    ratio_sq_ij = σ_sq / r_sq
+                    ratio_6_ij = ratio_sq_ij^3
+                    ratio_12_ij = ratio_6_ij^2
                     
-                    # V_shifted(r) = V_LJ(r) - V_LJ(r_c)
-                    lj_potential = four_ε * (term^2 - term)
-
-                    if ε ==0 && lj_potential < 0 # 处理 ε 为 0 的情况，为纯排斥势能
-                        lj_potential = 0.0
-                    end
-
-                    energy += (lj_potential - V_lj_at_cutoff)
+                    # LJ 原始势能
+                    v_lj = four_eps * (ratio_12_ij - ratio_6_ij)
+                    
+                    # 应用平移
+                    # Total = V(r) - V(r_c)
+                    pair_energy = v_lj - shift_value
+                    
+                    # 【特殊处理 WCA】
+                    # 如果是纯排斥模式(WCA)，公式实际上是 V_LJ(r) + epsilon
+                    # 这里的 shift_value 已经是 -epsilon，所以 v_lj - (-eps) = v_lj + eps
+                    # 逻辑是通用的
+                    
+                    energy += pair_energy
                 end
             end
         end
+        
         return energy
     end
+
+
+    #     # **关键改动**: 选择一个更大的截断距离，典型的选择是 2.5σ
+    #     cutoff_lj = 2.5 * σ
+    #     cutoff_lj_sq = cutoff_lj^2
+
+    #     # LJ 参数
+    #     σ_pow6 = σ^6
+        
+    #     four_ε = 4.0 * ε
+
+    #     # **关键改动**: 计算在新的、更大的截断距离 cutoff_lj 处的LJ势能值，作为平移量
+    #     # V_LJ(r_c) = 4ε * [ (σ/r_c)^12 - (σ/r_c)^6 ]
+    #     term_at_cutoff = σ_pow6 / (cutoff_lj^6)
+    #     V_lj_at_cutoff = four_ε * (term_at_cutoff^2 - term_at_cutoff)
+
+    #     for i in 1:length(free_beads)
+    #         for j in i+1:length(free_beads)
+    #             dx = free_beads[i].x - free_beads[j].x
+    #             dy = free_beads[i].y - free_beads[j].y
+    #             dz = free_beads[i].z - free_beads[j].z
+    #             r_sq = dx^2 + dy^2 + dz^2
+                
+    #             # 使用新的截断距离进行判断
+    #             if r_sq < cutoff_lj_sq
+    #                 r_pow6 = r_sq^3
+    #                 term = σ_pow6 / r_pow6
+                    
+    #                 # V_shifted(r) = V_LJ(r) - V_LJ(r_c)
+    #                 lj_potential = four_ε * (term^2 - term)
+
+    #                 if ε ==0 && lj_potential < 0 # 处理 ε 为 0 的情况，为纯排斥势能
+    #                     lj_potential = 0.0
+    #                 end
+
+    #                 energy += (lj_potential - V_lj_at_cutoff)
+    #             end
+    #         end
+    #     end
+    #     return energy
+    # end
 
 
     #5. 计算单体与球形壁的相互作用势能
