@@ -37,7 +37,7 @@ k_bond = 10.0
 De_bond = 20.0
 R_wall = 10.0
 theta0_angle_pai = 0.5
-
+factor_effective_cutoff_Pcutoff_ik = 0.74
 
 # Free bead 参数
 fbead_r0 = 1.2

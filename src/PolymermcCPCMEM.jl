@@ -835,8 +835,13 @@ module PolymermcCPCMEM
         # r_min 是粒子"接触"的平衡距离 (势能最低点)
         # 设置为 1.0
         r_min = params.factor_effective_cutoff_Pcutoff_ik * params.Pcutoff_ik
-        # ε = params.free_bead_LJ_ε  
-        σ = r_min / (2.0^(1.0/6.0))
+        # ε = params.free_bead_LJ_ε
+
+        σ = r_min 
+        # σ 直接对应LJ势能为0的点，对应排斥半径
+
+        # σ = r_min / (2.0^(1.0/6.0))
+        
         σ_sq = σ^2
         σ_pow6 = σ^6
 
@@ -3088,7 +3093,25 @@ function mcdoublepivot!(
         parallel_runs = config["parallel"]["runs_per_iter"]
 
         results_per_worker = @distributed (append!) for _ in 1:parallel_runs
+
             # 3. 动态构建 SimulationParameters
+            # --- 自动计算 r0 和 kc (Wrapper Method) ---
+            val_Pcutoff_ik = phys_conf["Pcutoff_ik"]
+            val_factor = phys_conf["factor_effective_cutoff_Pcutoff_ik"]
+            
+            # A. 绑定 r0 到 LJ 排斥半径
+            # 这样 tanh 的中心点(0.5)正好对应 LJ 势能的最低点
+            calc_fbead_r0 = val_factor * val_Pcutoff_ik
+            
+            # B. 自动计算 kc (锐度)
+            # 目标：确保在 r = Pcutoff_ik (近邻搜索截断) 处，Pij 衰减至 ~0
+            # 也就是要求 tanh(kc * (cutoff - r0)) ≈ 1.0 (取 4.0 对应 0.9993)
+            # gap 是从核心 r0 到硬截断 Pcutoff 的距离 (即"皮层厚度")
+            gap = val_Pcutoff_ik - calc_fbead_r0
+            
+            # 防止除以0 (如果 factor >= 1.0, 物理上不合理，给予极大值模拟阶跃函数)
+            calc_fbead_kc = (gap > 1e-6) ? (4.0 / gap) : 100.0
+
             params = SimulationParameters(
                 # 动态变量
                 alpha = alpha_matrix,
@@ -3117,11 +3140,15 @@ function mcdoublepivot!(
                 R_wall = phys_conf["R_wall"],
                 
                 # Free bead 参数
-                r0 = phys_conf["fbead_r0"],
-                k_c = phys_conf["fbead_kc"],
-                Pcutoff_ik = phys_conf["Pcutoff_ik"],
+                # r0 = phys_conf["fbead_r0"],
+                # k_c = phys_conf["fbead_kc"],
+                # Free bead 参数  自动计算   
+                r0 = calc_fbead_r0,
+                k_c = calc_fbead_kc,
+                Pcutoff_ik = val_Pcutoff_ik,
                 free_bead_LJ_ε = phys_conf["free_bead_LJ_epsilon"],
-                
+                factor_effective_cutoff_Pcutoff_ik = val_factor,
+
                 # 接触计算与Loop
                 loop_cutoff = phys_conf["loop_cutoff"],
                 calculate_contacts_r0 = phys_conf["calc_contact_r0"],
