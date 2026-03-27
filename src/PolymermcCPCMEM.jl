@@ -848,7 +848,11 @@ module PolymermcCPCMEM
 
         # 2. 判断模式：是"纯排斥"还是"吸引+排斥"？
         input_epsilon = params.free_bead_LJ_ε
-
+        # 增加模式不使用LJ
+        if input_epsilon < -1
+            return energy
+        end
+        
         # 初始化计算参数
         local_epsilon::Float64 = 0.0
         cutoff_sq::Float64 = 0.0
@@ -3079,6 +3083,15 @@ function mcdoublepivot!(
         tf_counts = Tuple(sim_conf["tf_counts"])
         tf_connectivities = Tuple(sim_conf["tf_connectivities"])
         
+        # 修复：如果 tf_counts[1] 为 0，交换索引 1 和 2 的元素
+        if tf_counts[1] == 0
+            # 交换 tf_counts 的第 1 和第 2 个元素
+            tf_counts = (tf_counts[2], tf_counts[1])
+            # 交换 tf_connectivities 的第 1 和第 2 个元素
+            tf_connectivities = (tf_connectivities[2], tf_connectivities[1])
+        end
+
+
         # 计算 connectivity_map
         if tf_counts[1] == -1
             connectivity_map = Int[]
