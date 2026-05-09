@@ -11,7 +11,7 @@ using PolymermcCPCMEM
 # ==============================================================================
 N = 100
 counts = (50, 50)
-conns = (2, 6) # 混合连接，测试你的 batch kernel
+conns = (2, 10) # 混合连接，测试你的 batch kernel
 params = SimulationParameters(
     N = N,
     tf_counts = counts,
