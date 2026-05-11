@@ -70,8 +70,8 @@ println("Reading Hi-C target from: $hic_data_path")
 target_contact = read_alpha_from_file(hic_data_path, N)
 
 # 初始化 alpha (全0，不再读取文件)
-input_alpha = config["input"]["input_alpha"]
-initial_alpha = input_alpha
+# input_alpha = config["input"]["input_alpha"]
+initial_alpha = zeros(Float64, N, N)
 initial_alpha_0 = zeros(Float64, N, N)
 
 # --- 5. 运行优化 ---
