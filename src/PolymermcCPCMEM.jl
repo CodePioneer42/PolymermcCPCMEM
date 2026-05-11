@@ -1045,8 +1045,14 @@ module PolymermcCPCMEM
                 _process_batch_N5!(bead_range, chain, free_beads, params)
             elseif K == 6
                 _process_batch_N6!(bead_range, chain, free_beads, params)
+            elseif K == 8
+                _process_batch_N8!(bead_range, chain, free_beads, params)
             elseif K == 10
                 _process_batch_N10!(bead_range, chain, free_beads, params)
+            elseif K == 12
+                _process_batch_N12!(bead_range, chain, free_beads, params)
+            else
+                error("Unsupported TF connectivity: $K")
             end
 
             current_idx += count
@@ -1156,6 +1162,20 @@ module PolymermcCPCMEM
         return (current[1], current[2], current[3], current[4], current[5], new)
     end
 
+    @inline function insert_sorted_tuple_N8(
+        current::NTuple{8, Tuple{Float64, Int}}, dist::Float64, idx::Int
+    )
+        new = (dist, idx)
+        dist < current[1][1] && return (new, current[1], current[2], current[3], current[4], current[5], current[6], current[7])
+        dist < current[2][1] && return (current[1], new, current[2], current[3], current[4], current[5], current[6], current[7])
+        dist < current[3][1] && return (current[1], current[2], new, current[3], current[4], current[5], current[6], current[7])
+        dist < current[4][1] && return (current[1], current[2], current[3], new, current[4], current[5], current[6], current[7])
+        dist < current[5][1] && return (current[1], current[2], current[3], current[4], new, current[5], current[6], current[7])
+        dist < current[6][1] && return (current[1], current[2], current[3], current[4], current[5], new, current[6], current[7])
+        dist < current[7][1] && return (current[1], current[2], current[3], current[4], current[5], current[6], new, current[7])
+        return (current[1], current[2], current[3], current[4], current[5], current[6], current[7], new)
+    end
+
     @inline function insert_sorted_tuple_N10(
         current::NTuple{10, Tuple{Float64, Int}}, dist::Float64, idx::Int
     )
@@ -1170,6 +1190,24 @@ module PolymermcCPCMEM
         dist < current[8][1] && return (current[1], current[2], current[3], current[4], current[5], current[6], current[7], new, current[8], current[9])
         dist < current[9][1] && return (current[1], current[2], current[3], current[4], current[5], current[6], current[7], current[8], new, current[9])
         return (current[1], current[2], current[3], current[4], current[5], current[6], current[7], current[8], current[9], new)
+    end
+
+    @inline function insert_sorted_tuple_N12(
+        current::NTuple{12, Tuple{Float64, Int}}, dist::Float64, idx::Int
+    )
+        new = (dist, idx)
+        dist < current[1][1] && return (new, current[1], current[2], current[3], current[4], current[5], current[6], current[7], current[8], current[9], current[10], current[11])
+        dist < current[2][1] && return (current[1], new, current[2], current[3], current[4], current[5], current[6], current[7], current[8], current[9], current[10], current[11])
+        dist < current[3][1] && return (current[1], current[2], new, current[3], current[4], current[5], current[6], current[7], current[8], current[9], current[10], current[11])
+        dist < current[4][1] && return (current[1], current[2], current[3], new, current[4], current[5], current[6], current[7], current[8], current[9], current[10], current[11])
+        dist < current[5][1] && return (current[1], current[2], current[3], current[4], new, current[5], current[6], current[7], current[8], current[9], current[10], current[11])
+        dist < current[6][1] && return (current[1], current[2], current[3], current[4], current[5], new, current[6], current[7], current[8], current[9], current[10], current[11])
+        dist < current[7][1] && return (current[1], current[2], current[3], current[4], current[5], current[6], new, current[7], current[8], current[9], current[10], current[11])
+        dist < current[8][1] && return (current[1], current[2], current[3], current[4], current[5], current[6], current[7], new, current[8], current[9], current[10], current[11])
+        dist < current[9][1] && return (current[1], current[2], current[3], current[4], current[5], current[6], current[7], current[8], new, current[9], current[10], current[11])
+        dist < current[10][1] && return (current[1], current[2], current[3], current[4], current[5], current[6], current[7], current[8], current[9], new, current[10], current[11])
+        dist < current[11][1] && return (current[1], current[2], current[3], current[4], current[5], current[6], current[7], current[8], current[9], current[10], new, current[11])
+        return (current[1], current[2], current[3], current[4], current[5], current[6], current[7], current[8], current[9], current[10], current[11], new)
     end
 
     function _process_batch_N2!(
@@ -1479,6 +1517,70 @@ module PolymermcCPCMEM
         return nothing
     end
 
+    function _process_batch_N8!(
+        bead_range::UnitRange{Int},
+        chain::Vector{Particle3D},
+        free_beads::Vector{Particle3D},
+        params::SimulationParameters
+    )
+        N_MAX_C = 8
+        N_chain = length(chain)
+        Pij_mediated_matrix = params.Pij_mediated_matrix
+
+        Pcutoff_ik_sq = params.Pcutoff_ik^2
+        k_c = params.k_c
+        r0 = params.r0
+
+        initial_neighbors = ntuple(_ -> (Inf, -1), Val(N_MAX_C))
+
+        for k_bead in bead_range
+            bead = free_beads[k_bead]
+            closest_neighbors = initial_neighbors
+
+            for i_mono in 1:N_chain
+                mono = chain[i_mono]
+                dx = mono.x - bead.x; dy = mono.y - bead.y; dz = mono.z - bead.z
+                rik_sq = dx*dx + dy*dy + dz*dz
+
+                if rik_sq < Pcutoff_ik_sq && rik_sq < closest_neighbors[N_MAX_C][1]^2
+                    rik = sqrt(max(0.0, rik_sq))
+                    if rik < closest_neighbors[N_MAX_C][1]
+                        closest_neighbors = insert_sorted_tuple_N8(closest_neighbors, rik, i_mono)
+                    end
+                end
+            end
+
+            params.fbead_contact[k_bead, 1] = closest_neighbors[1][2]
+            params.fbead_contact[k_bead, 2] = closest_neighbors[2][2]
+            params.fbead_contact[k_bead, 3] = closest_neighbors[3][2]
+            params.fbead_contact[k_bead, 4] = closest_neighbors[4][2]
+            params.fbead_contact[k_bead, 5] = closest_neighbors[5][2]
+            params.fbead_contact[k_bead, 6] = closest_neighbors[6][2]
+            params.fbead_contact[k_bead, 7] = closest_neighbors[7][2]
+            params.fbead_contact[k_bead, 8] = closest_neighbors[8][2]
+
+            closest_neighbors[2][2] == -1 && continue
+
+            for i in 1:(N_MAX_C-1)
+                dist1, idx1 = closest_neighbors[i]; idx1 == -1 && break
+                for j in (i + 1):N_MAX_C
+                    dist2, idx2 = closest_neighbors[j]; idx2 == -1 && break
+                    i_pair, j_pair = minmax(idx1, idx2)
+                    (j_pair - i_pair) < 2 && continue
+
+                    @fastmath begin
+                        P_ik = 0.5 * (1.0 - tanh(k_c * (dist1 - r0)))
+                        P_jk = 0.5 * (1.0 - tanh(k_c * (dist2 - r0)))
+                        arg = 1.0 - P_ik * P_jk
+                        term = log(max(eps(Float64), arg))
+                    end
+                    @inbounds Pij_mediated_matrix[i_pair, j_pair] += term
+                end
+            end
+        end
+        return nothing
+    end
+
     function _process_batch_N10!(
         bead_range::UnitRange{Int}, 
         chain::Vector{Particle3D}, 
@@ -1522,6 +1624,74 @@ module PolymermcCPCMEM
             params.fbead_contact[k_bead, 8] = closest_neighbors[8][2]
             params.fbead_contact[k_bead, 9] = closest_neighbors[9][2]
             params.fbead_contact[k_bead, 10] = closest_neighbors[10][2]
+
+            closest_neighbors[2][2] == -1 && continue
+
+            for i in 1:(N_MAX_C-1)
+                dist1, idx1 = closest_neighbors[i]; idx1 == -1 && break
+                for j in (i + 1):N_MAX_C
+                    dist2, idx2 = closest_neighbors[j]; idx2 == -1 && break
+                    i_pair, j_pair = minmax(idx1, idx2)
+                    (j_pair - i_pair) < 2 && continue
+
+                    @fastmath begin
+                        P_ik = 0.5 * (1.0 - tanh(k_c * (dist1 - r0)))
+                        P_jk = 0.5 * (1.0 - tanh(k_c * (dist2 - r0)))
+                        arg = 1.0 - P_ik * P_jk
+                        term = log(max(eps(Float64), arg))
+                    end
+                    @inbounds Pij_mediated_matrix[i_pair, j_pair] += term
+                end
+            end
+        end
+        return nothing
+    end
+
+    function _process_batch_N12!(
+        bead_range::UnitRange{Int},
+        chain::Vector{Particle3D},
+        free_beads::Vector{Particle3D},
+        params::SimulationParameters
+    )
+        N_MAX_C = 12
+        N_chain = length(chain)
+        Pij_mediated_matrix = params.Pij_mediated_matrix
+
+        Pcutoff_ik_sq = params.Pcutoff_ik^2
+        k_c = params.k_c
+        r0 = params.r0
+
+        initial_neighbors = ntuple(_ -> (Inf, -1), Val(N_MAX_C))
+
+        for k_bead in bead_range
+            bead = free_beads[k_bead]
+            closest_neighbors = initial_neighbors
+
+            for i_mono in 1:N_chain
+                mono = chain[i_mono]
+                dx = mono.x - bead.x; dy = mono.y - bead.y; dz = mono.z - bead.z
+                rik_sq = dx*dx + dy*dy + dz*dz
+
+                if rik_sq < Pcutoff_ik_sq && rik_sq < closest_neighbors[N_MAX_C][1]^2
+                    rik = sqrt(max(0.0, rik_sq))
+                    if rik < closest_neighbors[N_MAX_C][1]
+                        closest_neighbors = insert_sorted_tuple_N12(closest_neighbors, rik, i_mono)
+                    end
+                end
+            end
+
+            params.fbead_contact[k_bead, 1] = closest_neighbors[1][2]
+            params.fbead_contact[k_bead, 2] = closest_neighbors[2][2]
+            params.fbead_contact[k_bead, 3] = closest_neighbors[3][2]
+            params.fbead_contact[k_bead, 4] = closest_neighbors[4][2]
+            params.fbead_contact[k_bead, 5] = closest_neighbors[5][2]
+            params.fbead_contact[k_bead, 6] = closest_neighbors[6][2]
+            params.fbead_contact[k_bead, 7] = closest_neighbors[7][2]
+            params.fbead_contact[k_bead, 8] = closest_neighbors[8][2]
+            params.fbead_contact[k_bead, 9] = closest_neighbors[9][2]
+            params.fbead_contact[k_bead, 10] = closest_neighbors[10][2]
+            params.fbead_contact[k_bead, 11] = closest_neighbors[11][2]
+            params.fbead_contact[k_bead, 12] = closest_neighbors[12][2]
 
             closest_neighbors[2][2] == -1 && continue
 
@@ -3061,7 +3231,7 @@ function mcdoublepivot!(
     # 3. 模拟流程控制 (Run Core & Parallel)
     # ==============================================================================
 
-    function run_simulation_core(params::SimulationParameters, snapshot_base_dir)
+    function run_simulation_core(params::SimulationParameters, snapshot_base_dir; save_structures::Bool=true)
         worker_id = myid()
         pdb_filename = joinpath(snapshot_base_dir, "worker_$(worker_id).pdb")
         energy_filename = joinpath(snapshot_base_dir, "energy_worker_$(worker_id).txt")
@@ -3132,16 +3302,21 @@ function mcdoublepivot!(
             end
         end
         
-        open(energy_filename, "w") do f
-            for line in output_buffer; println(f, line); end
-        end
-
         if isempty(output_chains)
             error("No valid chains recorded on worker $(worker_id)")
         end
-        for i in 1:length(output_chains)
-            write_pdb_multiframe(output_chains[i], tem_beads[i], pdb_filename, i, params)
+
+        if save_structures
+            mkpath(snapshot_base_dir)
+            open(energy_filename, "w") do f
+                for line in output_buffer; println(f, line); end
+            end
+
+            for i in 1:length(output_chains)
+                write_pdb_multiframe(output_chains[i], tem_beads[i], pdb_filename, i, params)
+            end
         end
+
         ensemble_contacts, ensemble_distances = calculate_modulated_contact_probability(output_chains, tem_beads, params)
         
         return ensemble_contacts, ensemble_distances
@@ -3149,12 +3324,12 @@ function mcdoublepivot!(
 
     # -------------------------------------------------------------------------
     # 并行模拟调度器 (从 Config 构建参数)
-    function run_parallel_simulations(alpha_matrix, alpha_0_matrix, config::Dict; iter_num=0)
+    function run_parallel_simulations(alpha_matrix, alpha_0_matrix, config::Dict; iter_num=0, save_structures::Bool=true)
         
         # 输出路径处理
         output_dir = config["experiment"]["output_dir"]
         snapshot_base_dir = joinpath(output_dir, "sim_out", "iter_$(iter_num)")
-        mkpath(snapshot_base_dir)
+        save_structures && mkpath(snapshot_base_dir)
         
         # 提取 Simulation 部分配置
         sim_conf = config["simulation"]
@@ -3252,7 +3427,7 @@ function mcdoublepivot!(
                 calculate_contacts_kc = phys_conf["calc_contact_kc"]
             )
             
-            [run_simulation_core(params, snapshot_base_dir)]
+            [run_simulation_core(params, snapshot_base_dir; save_structures=save_structures)]
         end
 
         # 聚合结果
@@ -3320,7 +3495,7 @@ function mcdoublepivot!(
 
             # 2. 运行并行模拟 (传入 config)
             simulated_contact, _ = run_parallel_simulations(
-                alpha, alpha_0, config; iter_num=t
+                alpha, alpha_0, config; iter_num=t, save_structures=(t == maxiter)
             )
             println("Simulations complete.")
 
