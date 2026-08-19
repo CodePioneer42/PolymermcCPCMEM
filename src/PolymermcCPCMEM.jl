@@ -795,15 +795,13 @@ module PolymermcCPCMEM
 
         # 预计算常数, 确保在截断处能量为0 (Shifted LJ potential)
         # 这可以避免能量在截断点发生跳跃
-        inv_cutoff_sq = 1.0 / cutoff_sq
-        inv_cutoff_6 = inv_cutoff_sq^3
-        inv_cutoff_12 = inv_cutoff_6^2
-        shift_energy = 4.0 * ε * (inv_cutoff_12 - inv_cutoff_6)
+        sigma_sq = σ^2
+        sigma_over_cutoff_6 = (sigma_sq / cutoff_sq)^3
+        shift_energy = 4.0 * ε * (sigma_over_cutoff_6^2 - sigma_over_cutoff_6)
 
         for i in 1:length(chain)
-            # 内层循环只到 i + 5，同时要确保不超出链的长度
-            # 并且 j 仍然需要大于 i+1 以避免键和角
-            start_j = i + 2 
+            # 排除直接成键的 i,i+1 和受键角势约束的 i,i+2
+            start_j = i + 3
             end_j = min(i + lj_range, length(chain)) # 关键修改：限制j的最大值
             for j in start_j:end_j
 
@@ -814,12 +812,10 @@ module PolymermcCPCMEM
 
                 if r_sq < cutoff_sq
                     # --- [MODIFIED] 使用标准的12-6 LJ势能 ---
-                    inv_r_sq = 1.0 / r_sq
-                    inv_r_6 = inv_r_sq^3
-                    inv_r_12 = inv_r_6^2
+                    sigma_over_r_6 = (sigma_sq / r_sq)^3
                     
                     # 计算LJ势并加上能量偏移
-                    lj_potential = 4.0 * ε * (σ^12 * inv_r_12 - σ^6 * inv_r_6)
+                    lj_potential = 4.0 * ε * (sigma_over_r_6^2 - sigma_over_r_6)
                     energy += lj_potential - shift_energy
                 end
             end
@@ -3110,9 +3106,9 @@ function mcdoublepivot!(
         lj_range = params.lj_range
         
         # Shift energy constants
-        inv_cut2 = 1.0 / cutoff_sq
-        inv_cut6 = inv_cut2^3
-        shift = 4.0 * ε * (inv_cut6^2 - inv_cut6)
+        sigma_sq = σ^2
+        sigma_over_cutoff_6 = (sigma_sq / cutoff_sq)^3
+        shift = 4.0 * ε * (sigma_over_cutoff_6^2 - sigma_over_cutoff_6)
         
         N = length(chain)
         # Loop limits based on lj_range
@@ -3120,19 +3116,16 @@ function mcdoublepivot!(
         end_j = min(N, idx + lj_range)
         
         @inbounds for j in start_j:end_j
-            # Skip self and neighbors involved in bonds (usually |i-j| > 1 or 2 depending on physics)
-            # Assuming 1-2 and 1-3 exclusion handled by bond/angle, standard LJ often excludes |i-j| <= 2?
-            # Your original code used: start_j = i + 2. Let's keep consistency: exclude |i-j| <= 1
-            if abs(idx - j) < 2 continue end 
+            # Exclude self, directly bonded neighbors, and i,i+2 angle neighbors.
+            if abs(idx - j) <= 2 continue end
 
             pj = chain[j]
             dx, dy, dz = p.x - pj.x, p.y - pj.y, p.z - pj.z
             r_sq = dx^2 + dy^2 + dz^2
             
             if r_sq < cutoff_sq
-                inv_r2 = 1.0 / r_sq
-                inv_r6 = inv_r2^3
-                E += 4.0 * ε * (inv_r6^2 - inv_r6) - shift
+                sigma_over_r_6 = (sigma_sq / r_sq)^3
+                E += 4.0 * ε * (sigma_over_r_6^2 - sigma_over_r_6) - shift
             end
         end
         return E
