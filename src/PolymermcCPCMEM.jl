@@ -53,7 +53,7 @@ module PolymermcCPCMEM
         # LJ 参数
         lj_epsilon::Float64 = 0.0
         lj_sigma::Float64 = 0.5
-        lj_cutoff::Float64 = 2.5
+        soft_core_E_cut::Float64 = 6.0
         lj_range::Int = 65
         free_bead_LJ_ε::Float64 = 0.0
 
@@ -779,25 +779,52 @@ module PolymermcCPCMEM
         return energy
     end
 
-    # 3. 链内非键相互作用能, 使用标准的Lennard-Jones势能
+    @inline function soft_core_repulsive_pair_energy(
+        r_sq::Float64,
+        ε::Float64,
+        σ_sq::Float64,
+        E_cut::Float64,
+        r_o_sq::Float64,
+        r_min_sq::Float64,
+    )::Float64
+        r_sq > r_min_sq && return 0.0
+        r_sq == 0.0 && return E_cut
+
+        sigma_over_r_6 = (σ_sq / r_sq)^3
+        U_lj = 4.0 * ε * (sigma_over_r_6^2 - sigma_over_r_6) + ε
+
+        if r_sq <= r_o_sq
+            return 0.5 * E_cut * (1.0 + tanh(2.0 * U_lj / E_cut - 1.0))
+        end
+        return max(U_lj, 0.0)
+    end
+
+    @inline function soft_core_squared_distances(ε::Float64, σ::Float64, E_cut::Float64)
+        ε > 0.0 || throw(ArgumentError("lj_epsilon must be positive when soft-core repulsion is enabled"))
+        σ > 0.0 || throw(ArgumentError("lj_sigma must be positive"))
+        E_cut > 0.0 || throw(ArgumentError("soft_core_E_cut must be positive"))
+
+        σ_sq = σ^2
+        r_min_sq = σ_sq * 2.0^(1.0 / 3.0)
+        sigma_over_r_o_6 = 0.5 + sqrt(E_cut / (8.0 * ε))
+        r_o_sq = σ_sq / sigma_over_r_o_6^(1.0 / 3.0)
+        return σ_sq, r_o_sq, r_min_sq
+    end
+
+    # 3. 链内非键相互作用能：有限能垒的 soft-core 纯排斥势
     function compute_chain_nonbond_energy(chain::Vector{Particle3D}, params::SimulationParameters)::Float64
         energy = 0.0
 
         ε = params.lj_epsilon
         σ = params.lj_sigma
+        E_cut = params.soft_core_E_cut
         lj_range = params.lj_range
-        cutoff_sq = params.lj_cutoff^2  # 使用距离的平方进行比较以避免开方运算
 
         # 如果epsilon为0, 则没有非键相互作用, 直接返回0以提高效率
         if ε == 0.0
             return 0.0
         end
-
-        # 预计算常数, 确保在截断处能量为0 (Shifted LJ potential)
-        # 这可以避免能量在截断点发生跳跃
-        sigma_sq = σ^2
-        sigma_over_cutoff_6 = (sigma_sq / cutoff_sq)^3
-        shift_energy = 4.0 * ε * (sigma_over_cutoff_6^2 - sigma_over_cutoff_6)
+        σ_sq, r_o_sq, r_min_sq = soft_core_squared_distances(ε, σ, E_cut)
 
         for i in 1:length(chain)
             # 排除直接成键的 i,i+1 和受键角势约束的 i,i+2
@@ -810,14 +837,9 @@ module PolymermcCPCMEM
                 dz = chain[i].z - chain[j].z
                 r_sq = dx^2 + dy^2 + dz^2 # 使用距离的平方
 
-                if r_sq < cutoff_sq
-                    # --- [MODIFIED] 使用标准的12-6 LJ势能 ---
-                    sigma_over_r_6 = (sigma_sq / r_sq)^3
-                    
-                    # 计算LJ势并加上能量偏移
-                    lj_potential = 4.0 * ε * (sigma_over_r_6^2 - sigma_over_r_6)
-                    energy += lj_potential - shift_energy
-                end
+                energy += soft_core_repulsive_pair_energy(
+                    r_sq, ε, σ_sq, E_cut, r_o_sq, r_min_sq
+                )
             end
         end
         
@@ -3102,13 +3124,9 @@ function mcdoublepivot!(
         
         E = 0.0
         σ = params.lj_sigma
-        cutoff_sq = params.lj_cutoff^2
+        E_cut = params.soft_core_E_cut
         lj_range = params.lj_range
-        
-        # Shift energy constants
-        sigma_sq = σ^2
-        sigma_over_cutoff_6 = (sigma_sq / cutoff_sq)^3
-        shift = 4.0 * ε * (sigma_over_cutoff_6^2 - sigma_over_cutoff_6)
+        σ_sq, r_o_sq, r_min_sq = soft_core_squared_distances(ε, σ, E_cut)
         
         N = length(chain)
         # Loop limits based on lj_range
@@ -3123,10 +3141,9 @@ function mcdoublepivot!(
             dx, dy, dz = p.x - pj.x, p.y - pj.y, p.z - pj.z
             r_sq = dx^2 + dy^2 + dz^2
             
-            if r_sq < cutoff_sq
-                sigma_over_r_6 = (sigma_sq / r_sq)^3
-                E += 4.0 * ε * (sigma_over_r_6^2 - sigma_over_r_6) - shift
-            end
+            E += soft_core_repulsive_pair_energy(
+                r_sq, ε, σ_sq, E_cut, r_o_sq, r_min_sq
+            )
         end
         return E
     end
@@ -3414,7 +3431,7 @@ function mcdoublepivot!(
                 k_bond = phys_conf["k_bond"],
                 De_bond = phys_conf["De_bond"],
                 lj_sigma = phys_conf["lj_sigma"],
-                lj_cutoff = phys_conf["lj_cutoff"],
+                soft_core_E_cut = get(phys_conf, "soft_core_E_cut", 6.0),
                 min_distance = get(phys_conf, "min_distance", 0.01),
                 R_wall = phys_conf["R_wall"],
                 
