@@ -3402,6 +3402,7 @@ function mcdoublepivot!(
                 De_bond = phys_conf["De_bond"],
                 lj_sigma = phys_conf["lj_sigma"],
                 lj_cutoff = phys_conf["lj_cutoff"],
+                min_distance = get(phys_conf, "min_distance", 0.01),
                 R_wall = phys_conf["R_wall"],
                 
                 # Free bead 参数
