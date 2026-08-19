@@ -3228,6 +3228,7 @@ function mcdoublepivot!(
         worker_id = myid()
         pdb_filename = joinpath(snapshot_base_dir, "worker_$(worker_id).pdb")
         energy_filename = joinpath(snapshot_base_dir, "energy_worker_$(worker_id).txt")
+        acceptance_filename = joinpath(snapshot_base_dir, "acceptance_worker_$(worker_id).txt")
         
         # 缓冲区
         output_buffer = String[]
@@ -3255,6 +3256,9 @@ function mcdoublepivot!(
 
         current_energy = compute_total_energy!(chain, free_beads, params)
         move_functions = (mcdiff!, mcdiff_free_bead!, mcpivot!, mcdoublepivot!, freebead_snake!)
+        move_names = ("mcdiff", "mcdiff_free_bead", "mcpivot", "mcdoublepivot", "freebead_snake")
+        attempted_moves = zeros(Int, length(move_functions))
+        accepted_moves = zeros(Int, length(move_functions))
         
         # move_functions = (mcdiff_fast!, mcdiff_free_bead!, mcpivot!, mcdoublepivot!, freebead_snake!)
         # 移动权重
@@ -3271,7 +3275,9 @@ function mcdoublepivot!(
         for step in 1:params.Steps_FINAL
             rand_val = rand(1:total_weight)
             move_idx = searchsortedfirst(cumulative_weights, rand_val)
-            _, current_energy = move_functions[move_idx](chain, free_beads, params, current_energy, T)
+            accepted, current_energy = move_functions[move_idx](chain, free_beads, params, current_energy, T)
+            attempted_moves[move_idx] += 1
+            accepted_moves[move_idx] += accepted
             
             if step > equilibration_steps && (step - equilibration_steps) % sampling_interval == 0
                 push!(output_chains, deepcopy(chain))
@@ -3303,6 +3309,13 @@ function mcdoublepivot!(
             mkpath(snapshot_base_dir)
             open(energy_filename, "w") do f
                 for line in output_buffer; println(f, line); end
+            end
+            open(acceptance_filename, "w") do f
+                println(f, "move attempts accepted ratio")
+                for i in eachindex(move_functions)
+                    ratio = attempted_moves[i] == 0 ? 0.0 : accepted_moves[i] / attempted_moves[i]
+                    println(f, move_names[i], " ", attempted_moves[i], " ", accepted_moves[i], " ", @sprintf("%.6f", ratio))
+                end
             end
 
             for i in 1:length(output_chains)
