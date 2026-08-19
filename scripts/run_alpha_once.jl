@@ -1,108 +1,84 @@
 #!/usr/bin/env julia
 
+#SBATCH --job-name CPCMEM_Opt
+#SBATCH --nodes 1
+#SBATCH --ntasks-per-node 12
+#SBATCH --partition i64m512r
+#SBATCH --output %j-out.txt
+#SBATCH --error %j-err.txt
+
 using Pkg
-Pkg.activate(joinpath(@__DIR__, ".."))
+Pkg.activate(joinpath(@__DIR__, "..")) 
 Pkg.instantiate()
 
 using Distributed
 using TOML
 using ArgParse
-using PolymermcCPCMEM
+using Printf
 
+# --- 1. 参数解析 ---
 function parse_commandline()
-    settings = ArgParseSettings()
-    @add_arg_table settings begin
+    s = ArgParseSettings()
+    @add_arg_table s begin
         "--config", "-c"
             help = "Path to the TOML configuration file"
             required = true
             arg_type = String
-        "--alpha-file", "-a"
-            help = "Path to the alpha matrix file"
-            required = true
-            arg_type = String
-        "--output-dir", "-o"
-            help = "Override experiment.output_dir from the config"
-            default = ""
-            arg_type = String
-        "--iter-token"
-            help = "Token used for sim_out/iter_<token>"
-            default = "single_alpha"
-            arg_type = String
-        "--dry-run"
-            help = "Print detected inputs and planned outputs without running simulation"
-            action = :store_true
     end
-    return parse_args(settings)
-end
-
-function write_config(path::String, config::Dict)
-    open(path, "w") do io
-        TOML.print(io, config)
-    end
+    return parse_args(s)
 end
 
 args = parse_commandline()
+config_path = args["config"]
 
-config_path = abspath(expanduser(args["config"]))
-alpha_file = abspath(expanduser(args["alpha-file"]))
-iter_token = args["iter-token"]
-
-isfile(config_path) || error("Config file not found: $config_path")
-isfile(alpha_file) || error("Alpha file not found: $alpha_file")
+if !isfile(config_path)
+    error("Config file not found: $config_path")
+end
 
 println("--- Loading Config: $config_path ---")
 config = TOML.parsefile(config_path)
 
-if !isempty(args["output-dir"])
-    config["experiment"]["output_dir"] = abspath(expanduser(args["output-dir"]))
-end
-
+# --- 2. 设置输出与备份 ---
 output_dir = config["experiment"]["output_dir"]
-snapshot_dir = joinpath(output_dir, "sim_out", "iter_" * iter_token)
-
-if args["dry-run"]
-    println("Dry run: single alpha simulation")
-    println("Config:       ", config_path)
-    println("Alpha file:   ", alpha_file)
-    println("Output dir:   ", output_dir)
-    println("Snapshot dir: ", snapshot_dir)
-    exit(0)
+if !isdir(output_dir)
+    mkpath(output_dir)
 end
-
-mkpath(output_dir)
 cp(config_path, joinpath(output_dir, "run_config.toml"), force=true)
-write_config(joinpath(output_dir, "run_config_effective.toml"), config)
 
+# --- 3. 设置并行环境 ---
 desired_workers = config["parallel"]["n_workers"]
 if nworkers() < desired_workers
     addprocs(desired_workers - nworkers())
 end
 println("Total workers: $(nworkers())")
 
-project_root = joinpath(@__DIR__, "..")
+# 在所有核心上加载包
 @everywhere begin
     using Pkg
-    Pkg.activate($project_root)
+    Pkg.activate(joinpath(@__DIR__, ".."))
     using PolymermcCPCMEM
     using LinearAlgebra
     using Statistics
     using Printf
 end
 
+# --- 4. 准备数据 ---
 N = config["simulation"]["N"]
-alpha = PolymermcCPCMEM.read_alpha_from_file(alpha_file, N)
-alpha_0 = zeros(Float64, N, N)
+hic_data_path = config["input"]["hic_data"]
 
-mean_contact, mean_distance = PolymermcCPCMEM.run_parallel_simulations(
-    alpha,
-    alpha_0,
-    config;
-    iter_num = iter_token,
+println("Reading Hi-C target from: $hic_data_path")
+target_contact = read_alpha_from_file(hic_data_path, N)
+
+# 初始化 alpha (全0，不再读取文件)
+input_alpha = config["input"]["input_alpha"]
+initial_alpha = read_alpha_from_file(input_alpha, N)
+initial_alpha_0 = zeros(Float64, N, N)
+
+# --- 5. 运行优化 ---
+# 直接将 config 字典传入，不再需要在脚本里拆包
+optimize_alpha_main(
+    initial_alpha,
+    initial_alpha_0,
+    target_contact,
+    config
 )
-
-mkpath(snapshot_dir)
-PolymermcCPCMEM.save_contact_map(alpha, joinpath(snapshot_dir, "alpha_input.txt"))
-PolymermcCPCMEM.save_contact_map(mean_contact, joinpath(snapshot_dir, "contact_single_alpha.txt"))
-PolymermcCPCMEM.save_contact_map(mean_distance, joinpath(snapshot_dir, "distance_single_alpha.txt"))
-
-println("Single alpha simulation complete: ", snapshot_dir)

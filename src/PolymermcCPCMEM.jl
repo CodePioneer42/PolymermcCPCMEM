@@ -517,7 +517,7 @@ module PolymermcCPCMEM
         end
 
         # 2. 根据模型计算接触概率图
-        total_N_B = params.tf_counts[1]
+        total_N_B = sum(params.tf_counts)
 
         # 如果没有TF粒子，则直接返回
         if total_N_B <= 0
