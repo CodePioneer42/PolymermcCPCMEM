@@ -17,6 +17,73 @@ function reference_soft_core(r, epsilon, sigma, E_cut)
     return max(U_lj, 0.0)
 end
 
+@testset "Bounded polymer background cohesion" begin
+    epsilon = 0.6
+    r0 = 1.5
+    kc = 4.0
+
+    @test PMC.background_cohesion_pair_energy(0.0, epsilon, r0, kc) ≈ -epsilon atol=1e-5
+    @test PMC.background_cohesion_pair_energy(r0^2, epsilon, r0, kc) == -0.5epsilon
+    @test abs(PMC.background_cohesion_pair_energy(10.0^2, epsilon, r0, kc)) < 1e-12
+    @test PMC.background_cohesion_pair_energy(1.0, 0.0, r0, kc) == 0.0
+
+    params = SimulationParameters(
+        N = 6,
+        lj_epsilon = 3.0,
+        lj_sigma = 0.9,
+        soft_core_E_cut = 6.0,
+        background_cohesion_epsilon = epsilon,
+        background_cohesion_r0 = r0,
+        background_cohesion_kc = kc,
+        lj_range = 80,
+    )
+    chain = [
+        Particle3D(0.0, 0.0, 0.0),
+        Particle3D(1.4, 0.0, 0.0),
+        Particle3D(2.2, 0.8, 0.0),
+        Particle3D(0.8, 0.5, 0.2),
+        Particle3D(2.4, 1.5, 0.4),
+        Particle3D(0.5, 1.0, 0.6),
+    ]
+
+    global_energy = PMC.compute_chain_nonbond_energy(chain, params)
+    local_sum = sum(
+        PMC.lj_particle_chain_energy(i, chain[i], chain, params)
+        for i in eachindex(chain)
+    )
+    @test global_energy ≈ local_sum / 2 atol=1e-12
+
+    moved_idx = 4
+    moved = Particle3D(1.0, 0.8, 0.4)
+    moved_chain = copy(chain)
+    moved_chain[moved_idx] = moved
+    global_delta = PMC.compute_chain_nonbond_energy(moved_chain, params) - global_energy
+    local_delta = (
+        PMC.lj_particle_chain_energy(moved_idx, moved, moved_chain, params) -
+        PMC.lj_particle_chain_energy(moved_idx, chain[moved_idx], chain, params)
+    )
+    @test global_delta ≈ local_delta atol=1e-12
+
+    angle_neighbor_chain = [
+        Particle3D(0.0, 0.0, 0.0),
+        Particle3D(10.0, 0.0, 0.0),
+        Particle3D(1.0, 0.0, 0.0),
+    ]
+    cohesion_only = SimulationParameters(
+        lj_epsilon = 0.0,
+        soft_core_E_cut = 0.0,
+        background_cohesion_epsilon = epsilon,
+        background_cohesion_r0 = r0,
+        background_cohesion_kc = kc,
+    )
+    @test PMC.compute_chain_nonbond_energy(angle_neighbor_chain, cohesion_only) == 0.0
+    @test PMC.lj_particle_chain_energy(1, angle_neighbor_chain[1], angle_neighbor_chain, cohesion_only) == 0.0
+
+    @test_throws ArgumentError PMC.validate_background_cohesion_parameters(-0.1, r0, kc)
+    @test_throws ArgumentError PMC.validate_background_cohesion_parameters(epsilon, 0.0, kc)
+    @test_throws ArgumentError PMC.validate_background_cohesion_parameters(epsilon, r0, 0.0)
+end
+
 @testset "Polymer soft-core repulsive energy" begin
     epsilon = 3.0
     sigma = 0.9

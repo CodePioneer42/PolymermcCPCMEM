@@ -54,6 +54,9 @@ module PolymermcCPCMEM
         lj_epsilon::Float64 = 0.0
         lj_sigma::Float64 = 0.5
         soft_core_E_cut::Float64 = 6.0
+        background_cohesion_epsilon::Float64 = 0.0
+        background_cohesion_r0::Float64 = 1.5
+        background_cohesion_kc::Float64 = 4.0
         lj_range::Int = 65
         free_bead_LJ_ε::Float64 = 0.0
 
@@ -811,20 +814,53 @@ module PolymermcCPCMEM
         return σ_sq, r_o_sq, r_min_sq
     end
 
-    # 3. 链内非键相互作用能：有限能垒的 soft-core 纯排斥势
+    @inline function validate_background_cohesion_parameters(
+        ε::Float64,
+        r0::Float64,
+        kc::Float64,
+    )
+        ε >= 0.0 || throw(ArgumentError("background_cohesion_epsilon must be non-negative"))
+        r0 > 0.0 || throw(ArgumentError("background_cohesion_r0 must be positive"))
+        kc > 0.0 || throw(ArgumentError("background_cohesion_kc must be positive"))
+        return nothing
+    end
+
+    @inline function background_cohesion_pair_energy(
+        r_sq::Float64,
+        ε::Float64,
+        r0::Float64,
+        kc::Float64,
+    )::Float64
+        ε == 0.0 && return 0.0
+
+        r = sqrt(r_sq)
+        return -0.5 * ε * (1.0 - tanh(kc * (r - r0)))
+    end
+
+    # 3. 链内非键相互作用能：有限能垒的 soft-core 排斥势与有界背景凝聚势
     function compute_chain_nonbond_energy(chain::Vector{Particle3D}, params::SimulationParameters)::Float64
         energy = 0.0
 
-        ε = params.lj_epsilon
+        ε_rep = params.lj_epsilon
         σ = params.lj_sigma
         E_cut = params.soft_core_E_cut
+        ε_bg = params.background_cohesion_epsilon
+        r0_bg = params.background_cohesion_r0
+        kc_bg = params.background_cohesion_kc
         lj_range = params.lj_range
 
-        # 如果epsilon为0, 则没有非键相互作用, 直接返回0以提高效率
-        if ε == 0.0
+        if ε_rep == 0.0 && ε_bg == 0.0
             return 0.0
         end
-        σ_sq, r_o_sq, r_min_sq = soft_core_squared_distances(ε, σ, E_cut)
+        if ε_bg != 0.0
+            # Validate once before entering the pair loop.
+            validate_background_cohesion_parameters(ε_bg, r0_bg, kc_bg)
+        end
+        if ε_rep != 0.0
+            σ_sq, r_o_sq, r_min_sq = soft_core_squared_distances(ε_rep, σ, E_cut)
+        else
+            σ_sq = r_o_sq = r_min_sq = 0.0
+        end
 
         for i in 1:length(chain)
             # 排除直接成键的 i,i+1 和受键角势约束的 i,i+2
@@ -837,9 +873,14 @@ module PolymermcCPCMEM
                 dz = chain[i].z - chain[j].z
                 r_sq = dx^2 + dy^2 + dz^2 # 使用距离的平方
 
-                energy += soft_core_repulsive_pair_energy(
-                    r_sq, ε, σ_sq, E_cut, r_o_sq, r_min_sq
-                )
+                if ε_rep != 0.0
+                    energy += soft_core_repulsive_pair_energy(
+                        r_sq, ε_rep, σ_sq, E_cut, r_o_sq, r_min_sq
+                    )
+                end
+                if ε_bg != 0.0
+                    energy += background_cohesion_pair_energy(r_sq, ε_bg, r0_bg, kc_bg)
+                end
             end
         end
         
@@ -3119,14 +3160,24 @@ function mcdoublepivot!(
     end
 
     @inline function lj_particle_chain_energy(idx::Int, p::Particle3D, chain::Vector{Particle3D}, params::SimulationParameters)
-        ε = params.lj_epsilon
-        if ε == 0.0 return 0.0 end
+        ε_rep = params.lj_epsilon
+        ε_bg = params.background_cohesion_epsilon
+        if ε_rep == 0.0 && ε_bg == 0.0 return 0.0 end
         
         E = 0.0
         σ = params.lj_sigma
         E_cut = params.soft_core_E_cut
+        r0_bg = params.background_cohesion_r0
+        kc_bg = params.background_cohesion_kc
         lj_range = params.lj_range
-        σ_sq, r_o_sq, r_min_sq = soft_core_squared_distances(ε, σ, E_cut)
+        if ε_bg != 0.0
+            validate_background_cohesion_parameters(ε_bg, r0_bg, kc_bg)
+        end
+        if ε_rep != 0.0
+            σ_sq, r_o_sq, r_min_sq = soft_core_squared_distances(ε_rep, σ, E_cut)
+        else
+            σ_sq = r_o_sq = r_min_sq = 0.0
+        end
         
         N = length(chain)
         # Loop limits based on lj_range
@@ -3141,9 +3192,14 @@ function mcdoublepivot!(
             dx, dy, dz = p.x - pj.x, p.y - pj.y, p.z - pj.z
             r_sq = dx^2 + dy^2 + dz^2
             
-            E += soft_core_repulsive_pair_energy(
-                r_sq, ε, σ_sq, E_cut, r_o_sq, r_min_sq
-            )
+            if ε_rep != 0.0
+                E += soft_core_repulsive_pair_energy(
+                    r_sq, ε_rep, σ_sq, E_cut, r_o_sq, r_min_sq
+                )
+            end
+            if ε_bg != 0.0
+                E += background_cohesion_pair_energy(r_sq, ε_bg, r0_bg, kc_bg)
+            end
         end
         return E
     end
@@ -3432,6 +3488,9 @@ function mcdoublepivot!(
                 De_bond = phys_conf["De_bond"],
                 lj_sigma = phys_conf["lj_sigma"],
                 soft_core_E_cut = get(phys_conf, "soft_core_E_cut", 6.0),
+                background_cohesion_epsilon = get(phys_conf, "background_cohesion_epsilon", 0.0),
+                background_cohesion_r0 = get(phys_conf, "background_cohesion_r0", 1.5),
+                background_cohesion_kc = get(phys_conf, "background_cohesion_kc", 4.0),
                 min_distance = get(phys_conf, "min_distance", 0.01),
                 R_wall = phys_conf["R_wall"],
                 
