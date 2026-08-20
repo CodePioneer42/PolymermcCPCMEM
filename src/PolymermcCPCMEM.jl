@@ -62,6 +62,7 @@ module PolymermcCPCMEM
 
         # 墙和理想染色体
         R_wall::Float64 = 10.0
+        wall_k::Float64 = 100.0
         ideal_chrom_r0::Float64 = 3.0
         ideal_chrom_kc::Float64 = 0.8
 
@@ -1031,39 +1032,9 @@ module PolymermcCPCMEM
     # end
 
 
-    #5. 计算单体与球形壁的相互作用势能
+    # 5. 连续单向球形限制势：球内为零，球外二次增长。
     function compute_wall_interaction(chain::Vector{Particle3D}, params::SimulationParameters)::Float64
-        energy = 0.0
-        σ = params.r0_bond      # Lennard-Jones 参数
-        ε = 1.0      # Lennard-Jones 参数
-        Rc = [0.0, 0.0, 0.0]    # 球形壁的中心坐标
-        Rw = params.R_wall    # 球形壁的半径
-        cutoff_distance = σ * 2^(1/6)  # 截断距离
-        
-        for monomer in chain
-            # 计算单体到球形壁的最近距离
-            dx = monomer.x - Rc[1]
-            dy = monomer.y - Rc[2]
-            dz = monomer.z - Rc[3]
-            distance_to_center = sqrt(dx^2 + dy^2 + dz^2)
-            r_np = distance_to_center - Rw
-            
-            # 处理单体在球形壁外部的情况
-            if r_np < 0
-                r_np = abs(r_np)
-            else
-                energy += 0.5 * ε * (r_np)^6
-                continue
-            end
-            
-            # 计算相互作用势能
-            if r_np <= cutoff_distance
-                LJ_term = 4ε * ((σ / r_np)^12 - (σ / r_np)^6 + 1/4)
-                energy += LJ_term
-            end
-        end
-        
-        return energy
+        return sum(wall_particle_energy(monomer, params) for monomer in chain)
     end
 
     function compute_specific_interaction_energy(
@@ -3137,26 +3108,14 @@ function mcdoublepivot!(
     end
 
     @inline function wall_particle_energy(p::Particle3D, params::SimulationParameters)
-        # Rc assumed [0,0,0]
-        r_center = sqrt(p.x^2 + p.y^2 + p.z^2)
         Rw = params.R_wall
-        r_np = r_center - Rw
-        
-        if r_np >= 0 # Outside or on boundary
-            return 0.5 * 1.0 * r_np^6 # ε=1.0
-        end
-        
-        # Inside
-        r_np_abs = abs(r_np)
-        σ = params.r0_bond
-        cutoff = σ * 1.122462 # 2^(1/6)
-        
-        if r_np_abs <= cutoff
-            inv_r = σ / r_np_abs
-            inv_r6 = inv_r^6
-            return 4.0 * 1.0 * (inv_r6^2 - inv_r6 + 0.25)
-        end
-        return 0.0
+        k_wall = params.wall_k
+        Rw > 0.0 || throw(ArgumentError("R_wall must be positive"))
+        k_wall > 0.0 || throw(ArgumentError("wall_k must be positive"))
+
+        r_center = sqrt(p.x^2 + p.y^2 + p.z^2)
+        excess = r_center - Rw
+        return excess > 0.0 ? 0.5 * k_wall * excess^2 : 0.0
     end
 
     @inline function lj_particle_chain_energy(idx::Int, p::Particle3D, chain::Vector{Particle3D}, params::SimulationParameters)
@@ -3493,6 +3452,7 @@ function mcdoublepivot!(
                 background_cohesion_kc = get(phys_conf, "background_cohesion_kc", 4.0),
                 min_distance = get(phys_conf, "min_distance", 0.01),
                 R_wall = phys_conf["R_wall"],
+                wall_k = get(phys_conf, "wall_k", 100.0),
                 
                 # Free bead 参数
                 # r0 = phys_conf["fbead_r0"],

@@ -17,6 +17,38 @@ function reference_soft_core(r, epsilon, sigma, E_cut)
     return max(U_lj, 0.0)
 end
 
+@testset "Continuous one-sided spherical wall" begin
+    params = SimulationParameters(R_wall=5.0, wall_k=100.0)
+
+    @test PMC.wall_particle_energy(Particle3D(0.0, 0.0, 0.0), params) == 0.0
+    @test PMC.wall_particle_energy(Particle3D(4.99, 0.0, 0.0), params) == 0.0
+    @test PMC.wall_particle_energy(Particle3D(5.0, 0.0, 0.0), params) == 0.0
+    @test PMC.wall_particle_energy(Particle3D(5.5, 0.0, 0.0), params) ≈ 12.5 atol=1e-12
+    @test PMC.wall_particle_energy(Particle3D(6.0, 0.0, 0.0), params) ≈ 50.0 atol=1e-12
+
+    chain = [
+        Particle3D(1.0, 0.0, 0.0),
+        Particle3D(5.5, 0.0, 0.0),
+        Particle3D(0.0, -6.0, 0.0),
+    ]
+    @test PMC.compute_wall_interaction(chain, params) ≈ 62.5 atol=1e-12
+    @test PMC.compute_wall_interaction(chain, params) ≈
+          sum(PMC.wall_particle_energy(p, params) for p in chain) atol=1e-12
+
+    moved_chain = copy(chain)
+    moved_chain[2] = Particle3D(5.25, 0.0, 0.0)
+    global_delta = PMC.compute_wall_interaction(moved_chain, params) -
+                   PMC.compute_wall_interaction(chain, params)
+    local_delta = PMC.wall_particle_energy(moved_chain[2], params) -
+                  PMC.wall_particle_energy(chain[2], params)
+    @test global_delta ≈ local_delta atol=1e-12
+
+    @test_throws ArgumentError PMC.wall_particle_energy(
+        Particle3D(1.0, 0.0, 0.0), SimulationParameters(R_wall=0.0))
+    @test_throws ArgumentError PMC.wall_particle_energy(
+        Particle3D(1.0, 0.0, 0.0), SimulationParameters(wall_k=0.0))
+end
+
 @testset "Bounded polymer background cohesion" begin
     epsilon = 0.6
     r0 = 1.5
