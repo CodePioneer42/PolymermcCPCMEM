@@ -49,6 +49,53 @@ end
         Particle3D(1.0, 0.0, 0.0), SimulationParameters(wall_k=0.0))
 end
 
+@testset "Free-bead local validation and confinement" begin
+    # The polymer already contains a finite soft-core overlap. That unchanged pair
+    # must not cause an otherwise valid TF trial move to be rejected.
+    overlapping_chain = [
+        Particle3D(0.0, 0.0, 0.0),
+        Particle3D(0.2, 0.0, 0.0),
+    ]
+    valid_beads = [
+        Particle3D(2.0, 0.0, 0.0),
+        Particle3D(4.0, 0.0, 0.0),
+    ]
+    @test PMC.is_free_bead_position_valid(overlapping_chain, valid_beads, 1, 0.9)
+
+    chain_collision = [
+        Particle3D(0.5, 0.0, 0.0),
+        Particle3D(4.0, 0.0, 0.0),
+    ]
+    @test !PMC.is_free_bead_position_valid(overlapping_chain, chain_collision, 1, 0.9)
+
+    bead_collision = [
+        Particle3D(2.0, 0.0, 0.0),
+        Particle3D(2.5, 0.0, 0.0),
+    ]
+    @test !PMC.is_free_bead_position_valid(overlapping_chain, bead_collision, 1, 0.9)
+    @test_throws BoundsError PMC.is_free_bead_position_valid(overlapping_chain, valid_beads, 3, 0.9)
+
+    radius = 3.0
+    min_distance = 0.5
+    initialized = PMC.initialize_free_beads(
+        20,
+        [Particle3D(0.0, 0.0, 0.0)],
+        min_distance,
+        radius,
+    )
+    @test all(p.x^2 + p.y^2 + p.z^2 <= radius^2 for p in initialized)
+    @test all(
+        PMC.compute_distance_sq(initialized[i], initialized[j]) >= min_distance^2
+        for i in 1:(length(initialized) - 1) for j in (i + 1):length(initialized)
+    )
+    @test all(PMC.compute_distance_sq(p, Particle3D(0.0, 0.0, 0.0)) >= min_distance^2 for p in initialized)
+    @test_throws ArgumentError PMC.initialize_free_beads(1, Particle3D[], min_distance, 0.0)
+
+    params = SimulationParameters(R_wall=3.0, wall_k=100.0)
+    outside_tf = [Particle3D(4.0, 0.0, 0.0)]
+    @test PMC.compute_wall_interaction(outside_tf, params) ≈ 50.0 atol=1e-12
+end
+
 @testset "Bounded polymer background cohesion" begin
     epsilon = 0.6
     r0 = 1.5

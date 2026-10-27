@@ -297,29 +297,29 @@ module PolymermcCPCMEM
     #     return true
     # end
 
-    function initialize_free_beads(NB::Int, chain::Vector{Particle3D}, min_distance::Float64, box_size::Float64)::Vector{Particle3D}
+    function initialize_free_beads(NB::Int, chain::Vector{Particle3D}, min_distance::Float64, confinement_radius::Float64)::Vector{Particle3D}
         if NB == -1
-            return []
+            return Particle3D[]
         end
+        confinement_radius > 0.0 || throw(ArgumentError("confinement_radius must be positive"))
 
         free_beads = Vector{Particle3D}(undef, NB)
+        radius_sq = confinement_radius^2
         
         for i in 1:NB
             valid_position_found = false
             
             while !valid_position_found
-                # 随机生成自由粒子的坐标
-                new_x = rand() * box_size - box_size / 2
-                new_y = rand() * box_size - box_size / 2
-                new_z = rand() * box_size - box_size / 2
+                # Uniform rejection sampling inside the same sphere used by the wall.
+                new_x = (2rand() - 1) * confinement_radius
+                new_y = (2rand() - 1) * confinement_radius
+                new_z = (2rand() - 1) * confinement_radius
                 
-                # 检查新位置是否满足最小距离要求
-                if is_position_valid(chain, free_beads[1:i-1], new_x, new_y, new_z, min_distance)
+                if new_x^2 + new_y^2 + new_z^2 <= radius_sq &&
+                   is_position_valid(chain, free_beads[1:i-1], new_x, new_y, new_z, min_distance)
                     free_beads[i] = Particle3D(new_x, new_y, new_z)
                     valid_position_found = true
                 end
-                # free_beads[i] = Particle3D(new_x, new_y, new_z)
-                # valid_position_found = true
             end
         end
         
@@ -359,6 +359,34 @@ module PolymermcCPCMEM
             end
         end
         
+        return true
+    end
+
+    # Validate only the free bead changed by a trial move. Unchanged polymer-polymer
+    # overlaps can be finite under the soft-core potential and must not veto TF moves.
+    function is_free_bead_position_valid(
+        chain::Vector{Particle3D},
+        free_beads::Vector{Particle3D},
+        moved_idx::Int,
+        min_distance::Float64,
+    )::Bool
+        moved_idx in eachindex(free_beads) || throw(BoundsError(free_beads, moved_idx))
+        min_distance_sq = min_distance^2
+        moved_bead = free_beads[moved_idx]
+
+        @inbounds for particle in chain
+            if compute_distance_sq(moved_bead, particle) < min_distance_sq
+                return false
+            end
+        end
+
+        @inbounds for bead_idx in eachindex(free_beads)
+            bead_idx == moved_idx && continue
+            if compute_distance_sq(moved_bead, free_beads[bead_idx]) < min_distance_sq
+                return false
+            end
+        end
+
         return true
     end
 
@@ -657,8 +685,9 @@ module PolymermcCPCMEM
         # 4. 计算自由粒子间相互作用能（Free Bead Nonbonded）
         total_energy += compute_free_bead_energy(free_beads, params)
         
-        # 5. 与球形壁的相互作用
+        # 5. Polymer and TF interactions with the spherical wall
         total_energy += compute_wall_interaction(chain, params)
+        total_energy += compute_wall_interaction(free_beads, params)
 
         # 6. [重构] 计算所有特异性相互作用能 (alpha 项)
         total_energy += compute_specific_interaction_energy(chain, free_beads, params)
@@ -1034,7 +1063,7 @@ module PolymermcCPCMEM
 
     # 5. 连续单向球形限制势：球内为零，球外二次增长。
     function compute_wall_interaction(chain::Vector{Particle3D}, params::SimulationParameters)::Float64
-        return sum(wall_particle_energy(monomer, params) for monomer in chain)
+        return sum((wall_particle_energy(monomer, params) for monomer in chain); init=0.0)
     end
 
     function compute_specific_interaction_energy(
@@ -2103,7 +2132,7 @@ function mcpivot!(
             free_beads[k] = Particle3D(new_x, new_y, new_z)
         end
         
-        if !is_position_valid(chain, free_beads, params.min_distance)
+        if !is_free_bead_position_valid(chain, free_beads, k, params.min_distance)
             # 恢复旧坐标
             free_beads[k] = Particle3D(old_x, old_y, old_z)
             return (0, current_energy)  # 拒绝移动
@@ -2177,7 +2206,7 @@ function mcpivot!(
         # 更新自由粒子位置
         free_beads[k] = Particle3D(new_x, new_y, new_z)
         
-        if !is_position_valid(chain, free_beads, params.min_distance)
+        if !is_free_bead_position_valid(chain, free_beads, k, params.min_distance)
             # 如果新位置无效，恢复旧坐标并返回拒绝
             free_beads[k] = Particle3D(old_x, old_y, old_z)
             return (0, current_energy)
@@ -3274,7 +3303,7 @@ function mcdoublepivot!(
         chain = initialize_random_chain(params.N, params.r0_bond, params.min_distance, 1000)
 
         free_beads = if total_N_B > 0
-            initialize_free_beads(total_N_B, chain, params.min_distance, 20.0)
+            initialize_free_beads(total_N_B, chain, params.min_distance, params.R_wall)
         else
             Particle3D[] 
         end
@@ -3458,8 +3487,10 @@ function mcdoublepivot!(
                 # r0 = phys_conf["fbead_r0"],
                 # k_c = phys_conf["fbead_kc"],
                 # Free bead 参数  自动计算   
-                r0 = calc_fbead_r0,
-                k_c = calc_fbead_kc,
+                # r0 = calc_fbead_r0,
+                # k_c = calc_fbead_kc,
+                r0 = get(phys_conf, "fbead_r0", calc_fbead_r0),
+                k_c = get(phys_conf, "fbead_kc", calc_fbead_kc),
                 Pcutoff_ik = val_Pcutoff_ik,
                 free_bead_LJ_ε = phys_conf["free_bead_LJ_epsilon"],
                 factor_effective_cutoff_Pcutoff_ik = val_factor,
